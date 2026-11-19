@@ -1,155 +1,212 @@
 # RecruitFlow AI
 
-RecruitFlow AI is a local-first, AI-assisted recruiter email application with private resumes, grounded drafting/refinement, verified Gmail OAuth, one-at-a-time human-approved sending, sent/uncertain history, and same-thread follow-ups. Product scope and decisions live in [`docs/PROJECT.md`](docs/PROJECT.md).
+RecruitFlow AI is a local-first web application for creating personalized recruiter outreach without surrendering control of the final message. It grounds AI-generated drafts in a selected resume, reusable outreach purpose, and job context, then requires the user to review and explicitly approve every email and follow-up before Gmail sends it.
 
-## Prerequisites
+<!-- Screenshot placeholder: Compose, refinement, and final review workflow -->
+<!-- Screenshot placeholder: Settings, resumes, purposes, and Gmail connection -->
+<!-- Screenshot placeholder: Sent history and Gmail-threaded follow-ups -->
+
+## Implemented capabilities
+
+- Generate structured recruiter emails from a saved sender profile, selected PDF resume, outreach purpose, recipient details, and optional job description.
+- Manage multiple private resumes and reusable, editable purposes such as cold outreach, referral requests, already-applied notes, and reconnections.
+- Edit persisted drafts or ask AI to refine the current subject and body with a free-text instruction; revisions are proposed separately and never silently overwrite the draft.
+- Use direct Google Gemini or OpenRouter through a shared provider boundary, with optional one-at-a-time failover for eligible temporary provider failures.
+- Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
+- Review an immutable server-side snapshot and explicitly approve every individual send. Draft generation, saving, refinement, and review preparation never send email.
+- Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
+- Keep inbox access, automated outreach, scheduling, and background sending out of scope.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[Browser] -->|Compose, Settings, History| F[Next.js frontend]
+    F -->|JSON over localhost| B[FastAPI backend]
+
+    B --> DB[(PostgreSQL)]
+    B --> FS[Private PDF storage]
+    B --> AI[AI provider boundary]
+    AI --> G[Google Gemini API]
+    AI --> O[OpenRouter API]
+
+    B --> GS[Gmail service]
+    GS --> GO[Google OAuth and UserInfo]
+    GS --> GM[Gmail users.messages.send]
+
+    DB -->|Profiles, purposes, drafts,<br/>reviews, sends, history| B
+    FS -->|Resume text or approved attachment| B
+```
+
+AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI owns validation, provider calls, Gmail authorization, approval enforcement, persistence, and access to private resume files.
+
+## Tech stack
+
+| Area | Implementation |
+| --- | --- |
+| Frontend | Next.js 16, React 19, TypeScript 5.9, Tailwind CSS 4 |
+| Backend | Python 3.12, FastAPI, Pydantic Settings, Uvicorn, HTTPX |
+| Data | PostgreSQL 16, SQLAlchemy 2, Psycopg 3, Alembic |
+| AI | Google Gemini `generateContent`, OpenRouter chat completions, PyPDF text extraction |
+| Email | Google OAuth 2.0, OpenID Connect user info, Gmail `users.messages.send`, Python MIME tooling |
+| Security | Fernet token encryption, hashed OAuth state, private generated resume storage keys |
+| Testing | pytest with PostgreSQL integration tests; TypeScript type checking and Next.js production builds |
+
+Pinned dependency versions are available in [`backend/requirements.txt`](backend/requirements.txt) and [`frontend/package.json`](frontend/package.json).
+
+## Engineering details
+
+- **Grounded, structured AI output:** the shared prompt treats resume text, job descriptions, purposes, and refinement guidance as untrusted source data. Both providers must return a bounded object containing exactly `subject` and `body`, which is validated before persistence.
+- **Controlled provider failover:** failover is disabled by default. When enabled with a distinct provider, the backend tries it exactly once after a primary-provider rate limit, transport timeout, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free.
+- **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, and `gmail.send`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend.
+- **Server-enforced approval:** preparing a review snapshots the authenticated sender, recipient, subject, body, draft fingerprint, and attachment metadata. The attachment size and SHA-256 digest are checked again at dispatch. Any intervening draft or conversation change makes the review stale.
+- **Duplicate-send prevention:** PostgreSQL uniqueness constraints, row locks, and durable `pending -> sending -> sent|failed|uncertain` transitions prevent the same approval from being dispatched twice by concurrent requests.
+- **Conservative delivery state:** Gmail confirmation is required before a send becomes `sent`. An ambiguous timeout or transport failure after dispatch becomes non-retryable `uncertain`; the UI instructs the user to check Gmail Sent mail instead of blindly retrying.
+- **Threaded follow-ups without inbox access:** follow-ups use only RecruitFlow's stored outbound messages. The backend retains Gmail thread IDs and RFC `Message-ID` values, supplies `In-Reply-To` and `References`, and rejects follow-ups when same-thread delivery cannot be safely established.
+
+## Local setup on Windows
+
+### Prerequisites
 
 - Python 3.12
 - Node.js 20.9 or newer
 - Docker Desktop with Docker Compose
 - Windows PowerShell
+- A Google AI Studio API key or an OpenRouter key configured for an explicitly free model
+- A Google Cloud OAuth Web application if Gmail sending will be tested
 
-Run all commands from the repository root unless a command changes directory.
+Run these commands from the repository root unless the command changes directory.
 
-## First-time setup (Windows PowerShell)
+### 1. Create local configuration and install dependencies
 
 ```powershell
 Copy-Item .env.example .env
 Copy-Item backend/.env.example backend/.env
 Copy-Item frontend/.env.example frontend/.env.local
 
-# Reuse the existing environment; create it only when absent.
+# Reuse an existing virtual environment; create one only when absent.
 if (-not (Test-Path .venv)) { py -3.12 -m venv .venv }
 & .\.venv\Scripts\python.exe -m pip install -r backend\requirements-dev.txt
 
 Set-Location frontend
-npm.cmd install
+npm.cmd ci
 Set-Location ..
 ```
 
-The example credentials are local placeholders. Change them before exposing PostgreSQL beyond localhost. Uploaded resumes default to the Git-ignored `data/resumes/` directory.
+All copied environment files are ignored by Git. The committed examples contain placeholders only. Private resumes default to the ignored `data/resumes/` directory.
 
-## Configure AI
+### 2. Configure an AI provider
 
-Edit the ignored `backend/.env` file and set:
+Edit `backend/.env`. Gemini is the local default:
 
 ```dotenv
 AI_PROVIDER=gemini
-GEMINI_API_KEY=your-secret-api-key
+GEMINI_API_KEY=replace-with-your-key
 GEMINI_MODEL=gemini-3.5-flash-lite
+AI_FALLBACK_ENABLED=false
+AI_FALLBACK_PROVIDER=openrouter
 ```
 
-To use OpenRouter instead, set `AI_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, and an explicit free model ID. There is no automatic provider or paid fallback. Keys stay in the backend; automated tests use mocks.
+To use OpenRouter as the primary provider, set `AI_PROVIDER=openrouter`, provide `OPENROUTER_API_KEY`, and use `openrouter/free` or a model ID ending in `:free` for `OPENROUTER_MODEL`.
 
-## Configure Google OAuth
+To enable optional failover, set `AI_FALLBACK_ENABLED=true`, choose the distinct fallback in `AI_FALLBACK_PROVIDER`, and configure that provider's key and model as well. There is no paid fallback or recursive retry. The application cannot verify a Google project's billing tier; confirm Free Tier status in Google AI Studio before use.
 
-In Google Cloud, enable the Gmail API and create an OAuth 2.0 Web application client. Add this exact authorized redirect URI:
+### 3. Configure Google OAuth
+
+In Google Cloud:
+
+1. Enable the Gmail API.
+2. Configure the OAuth consent screen; if it is in Testing, add the Gmail account as a test user.
+3. Create an OAuth 2.0 client with application type **Web application**.
+4. Add this exact authorized redirect URI:
 
 ```text
 http://localhost:8001/api/gmail/oauth/callback
 ```
 
-If the consent screen is in Testing, add your Gmail account as a test user. Then set these values in the ignored `backend/.env`:
+RecruitFlow requests only:
 
-```dotenv
-FRONTEND_ORIGIN=http://localhost:3000
-GMAIL_OAUTH_CLIENT_ID=your-web-client-id
-GMAIL_OAUTH_CLIENT_SECRET=your-client-secret
-GMAIL_OAUTH_REDIRECT_URI=http://localhost:8001/api/gmail/oauth/callback
-GMAIL_TOKEN_ENCRYPTION_KEY=your-generated-fernet-key
-```
+- `openid`
+- `https://www.googleapis.com/auth/userinfo.email`
+- `https://www.googleapis.com/auth/gmail.send`
 
-Generate the encryption key once and retain it while the connection exists:
+Generate a Fernet key once:
 
 ```powershell
 & .\.venv\Scripts\python.exe -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-RecruitFlow requests only `openid`, `userinfo.email`, and `gmail.send`. OAuth tokens are encrypted in PostgreSQL. Deleting or changing the encryption key makes stored credentials unusable. Google OAuth apps in Testing can have short-lived refresh grants and are limited to configured test users.
+Add the OAuth values to `backend/.env`:
 
-For a safe local OAuth test, keep the API bound to `127.0.0.1`, confirm the Google consent screen lists exactly those three scopes, and use a Google test-user account you control. Connect from Settings and verify the displayed address. For an end-to-end send test, create a synthetic draft addressed to another account you control, start with no attachment, prepare the final review, compare every displayed field, and approve only when ready. Connecting, generating, saving, reopening, and preparing review never send. After a confirmed test, verify Gmail Sent mail and disconnect in Settings to revoke and remove the stored credentials.
+```dotenv
+FRONTEND_ORIGIN=http://localhost:3000
+GMAIL_OAUTH_CLIENT_ID=replace-with-your-web-client-id
+GMAIL_OAUTH_CLIENT_SECRET=replace-with-your-client-secret
+GMAIL_OAUTH_REDIRECT_URI=http://localhost:8001/api/gmail/oauth/callback
+GMAIL_TOKEN_ENCRYPTION_KEY=replace-with-the-generated-fernet-key
+```
 
-To verify follow-ups safely, send a new synthetic initial email after applying migration `20261118_0006`, open it in History, generate a follow-up with optional guidance, review/edit/refine it in Compose, save it, and prepare a new final review. Confirm the locked recipient, `Re:` subject, authenticated sender, attachment, and conversation notice before explicitly approving. Verify the message appears in the same Gmail thread. Older RecruitFlow sends without a stored RFC Message-ID remain readable but intentionally cannot guarantee follow-up threading.
+Retain the Fernet key while a Gmail connection exists; changing it makes stored tokens unreadable.
 
-## Apply migrations
-
-Start PostgreSQL, then apply all migrations:
+### 4. Start PostgreSQL and apply migrations
 
 ```powershell
 docker compose up -d postgres
 docker compose ps
+
 Set-Location backend
 & ..\.venv\Scripts\python.exe -m alembic upgrade head
 Set-Location ..
 ```
 
-## Start locally
+### 5. Run the application
 
-Use three PowerShell terminals from the repository root.
+Use separate PowerShell terminals from the repository root.
 
-Terminal 1 — PostgreSQL:
-
-```powershell
-docker compose up -d postgres
-docker compose ps
-```
-
-Terminal 2 — backend (`http://localhost:8001`, health at `http://localhost:8001/api/health`):
+Backend — `http://localhost:8001`:
 
 ```powershell
 Set-Location backend
-& ..\.venv\Scripts\python.exe -m alembic upgrade head
 & ..\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
 ```
 
-Terminal 3 — frontend (`http://localhost:3000`):
+Frontend — `http://localhost:3000`:
 
 ```powershell
 Set-Location frontend
 npm.cmd run dev
 ```
 
-Stop PostgreSQL without deleting local data:
+The backend health endpoint is `http://localhost:8001/api/health`. Stop PostgreSQL without deleting its named volume with `docker compose down`.
 
-```powershell
-docker compose down
-```
+## Testing
 
-## Test and build
-
-Backend integration tests require PostgreSQL. By default, the fixture derives an isolated `_test` database from `DATABASE_URL`, refuses any database whose name does not end in `_test`, creates it when needed, and validates PostgreSQL-specific default uniqueness. Set `TEST_DATABASE_URL` only to override that derived test database. Docker PostgreSQL must be running.
+Backend tests use PostgreSQL, mock all AI/Gmail calls, and refuse to run against a database whose name does not end in `_test`. By default, the fixture derives and creates `<DATABASE_URL database>_test`.
 
 ```powershell
 docker compose up -d postgres
+
 Set-Location backend
 & ..\.venv\Scripts\python.exe -m pytest
-
-& ..\.venv\Scripts\python.exe -m alembic upgrade head --sql
 & ..\.venv\Scripts\python.exe -m alembic check
+
 Set-Location ..\frontend
 npm.cmd run typecheck
 npm.cmd run build
 Set-Location ..
 ```
 
-## Create future migrations
+Latest verified backend result: **106 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
 
-```powershell
-Set-Location backend
-& ..\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "describe change"
-& ..\.venv\Scripts\python.exe -m alembic upgrade head
-```
+## Security limitations
 
-## Local-only identity boundary
+RecruitFlow currently uses one server-selected `LOCAL_OWNER_ID`. This prevents clients from choosing an owner but is **not authentication or multi-tenant isolation**. The application is intended for local development on `127.0.0.1` and is not suitable for public deployment as implemented.
 
-The backend selects one fixed local owner from `LOCAL_OWNER_ID`; API clients cannot submit user IDs. This is not authentication. Before any production deployment, add authenticated server-side identity resolution, authorization for every resource, secure session handling, and a migration plan for existing local-owner records.
+A public deployment would require real authentication and session authorization, per-request tenant isolation, HTTPS, production secret/key management and rotation, CSRF and cookie review, abuse controls, rate limiting, audit and retention policies, OAuth consent/security review, and end-to-end security testing. The application also does not read Gmail inbox content, detect replies, or determine whether an uncertain send was delivered.
 
-## Milestone 4 security and limitations
+## Roadmap
 
-- Every email requires a saved draft, a final server-created review snapshot, and an explicit approval action. Generation, saving, review preparation, and page loads never send mail.
-- A timeout after Gmail dispatch is recorded as `uncertain` and cannot be retried through the same approval; check Gmail Sent mail manually.
-- Confirmed sent drafts are read-only. Read-only send metadata is retained for the next history/follow-up milestone.
-- The app reads no inbox content and has no automatic, scheduled, bulk, follow-up, or background sending.
-- Image-only resumes require OCR elsewhere or must be omitted from generation.
-- The fixed `LOCAL_OWNER_ID` is not authentication. Keep both servers bound to localhost. Public deployment requires real authentication, session authorization, CSRF/cookie review, HTTPS, secure secret management, abuse controls, and a production security/privacy review.
+- Production authentication, authorization, observability, privacy controls, accessibility review, and deployment runbooks.
+- Optional V2 automated sending only as an explicit opt-in feature with additional safeguards. It is not implemented in V1; every current email and follow-up requires manual review and approval.
 
+Detailed product contracts and non-goals are maintained in [`docs/PROJECT.md`](docs/PROJECT.md).
