@@ -1,0 +1,3 @@
+Alembic migration environment for the RecruitFlow AI PostgreSQL database.
+No business-table migration exists in Milestone 1.
+
