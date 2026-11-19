@@ -16,7 +16,16 @@ from app.ai_provider import (
     get_ai_provider,
 )
 from app.database import get_db
-from app.models import EmailDraft, EmailPurpose, EmailSend, Resume, SenderProfile
+from app.gmail_api import _received_fingerprint
+from app.gmail_replies import clean_received_body
+from app.models import (
+    EmailDraft,
+    EmailPurpose,
+    EmailSend,
+    ReceivedGmailMessage,
+    Resume,
+    SenderProfile,
+)
 from app.resume_text import ResumeExtractionError, extract_resume_text
 from app.schemas import (
     EmailDraftResponse,
@@ -103,7 +112,16 @@ def _refinement_allowed(draft: EmailDraft, db: Session) -> bool:
 
 def _draft_response(draft: EmailDraft, db: Session) -> EmailDraftResponse:
     response = EmailDraftResponse.model_validate(draft)
-    return response.model_copy(update={"refinement_allowed": _refinement_allowed(draft, db)})
+    kind = (
+        "reply"
+        if draft.reply_to_received_message_id is not None
+        else "follow_up"
+        if draft.conversation_id is not None
+        else "initial"
+    )
+    return response.model_copy(
+        update={"refinement_allowed": _refinement_allowed(draft, db), "draft_kind": kind}
+    )
 
 
 def _reply_subject(subject: str) -> str:
@@ -130,13 +148,58 @@ def _followup_root(draft: EmailDraft, db: Session) -> EmailSend | None:
     return root
 
 
+def _latest_received(root: EmailSend, db: Session) -> ReceivedGmailMessage | None:
+    return db.scalar(
+        select(ReceivedGmailMessage)
+        .where(
+            ReceivedGmailMessage.owner_id == _owner_id(),
+            ReceivedGmailMessage.conversation_id == root.id,
+            ReceivedGmailMessage.gmail_thread_id == root.gmail_thread_id,
+        )
+        .order_by(
+            ReceivedGmailMessage.received_at.desc(),
+            ReceivedGmailMessage.created_at.desc(),
+        )
+        .limit(1)
+    )
+
+
+def _bound_received(draft: EmailDraft, root: EmailSend, db: Session) -> ReceivedGmailMessage | None:
+    if draft.reply_to_received_message_id is None:
+        return None
+    message = db.scalar(
+        select(ReceivedGmailMessage).where(
+            ReceivedGmailMessage.id == draft.reply_to_received_message_id,
+            ReceivedGmailMessage.owner_id == _owner_id(),
+            ReceivedGmailMessage.conversation_id == root.id,
+            ReceivedGmailMessage.gmail_thread_id == root.gmail_thread_id,
+        )
+    )
+    latest = _latest_received(root, db)
+    if (
+        message is None
+        or latest is None
+        or message.id != latest.id
+        or draft.reply_context_fingerprint != _received_fingerprint(message)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A newer or unavailable recruiter reply makes this draft stale. Generate a new AI reply.",
+        )
+    if not message.sender_email or message.sender_email.lower() != root.recipient_email.lower():
+        raise HTTPException(status_code=409, detail="The received-message sender is not permitted.")
+    return message
+
+
 def _validate_followup_payload(
     draft: EmailDraft, payload: EmailDraftUpdate | EmailRefinementRequest, db: Session
 ) -> EmailSend | None:
     root = _followup_root(draft, db)
     if root is None:
         return None
-    if payload.recipient_email != root.recipient_email:
+    received = _bound_received(draft, root, db)
+    expected_recipient = received.sender_email if received is not None else root.recipient_email
+    if payload.recipient_email.lower() != expected_recipient.lower():
         raise HTTPException(status_code=409, detail="A follow-up recipient cannot be changed.")
     if payload.subject != _reply_subject(root.subject):
         raise HTTPException(status_code=409, detail="A follow-up subject cannot leave its thread.")
@@ -173,6 +236,8 @@ def _generation_context(
     refinement_instruction: str | None = None,
     conversation_history: tuple[dict[str, str], ...] = (),
     is_followup: bool = False,
+    reply_guidance: str | None = None,
+    is_reply: bool = False,
 ) -> EmailGenerationContext:
     return EmailGenerationContext(
         sender_name=profile.name,
@@ -190,6 +255,8 @@ def _generation_context(
         refinement_instruction=refinement_instruction,
         conversation_history=conversation_history,
         is_followup=is_followup,
+        reply_guidance=reply_guidance,
+        is_reply=is_reply,
     )
 
 
@@ -198,7 +265,7 @@ async def generate_draft(
     payload: EmailGenerationRequest,
     db: Annotated[Session, Depends(get_db)],
     provider: Annotated[AIEmailProvider, Depends(get_ai_provider)],
-) -> EmailDraft:
+) -> EmailDraftResponse:
     existing_draft = None
     if payload.draft_id is not None:
         existing_draft = _owned_draft(payload.draft_id, db)
@@ -255,7 +322,7 @@ async def generate_draft(
     _apply_context(draft, payload)
     _commit(db)
     db.refresh(draft)
-    return draft
+    return _draft_response(draft, db)
 
 
 @router.post("/{draft_id}/refine", response_model=EmailRevisionResponse)
@@ -287,6 +354,7 @@ async def refine_draft(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     conversation_history: tuple[dict[str, str], ...] = ()
+    is_reply = draft.reply_to_received_message_id is not None
     if root is not None:
         sent_messages = [root, *list(db.scalars(
             select(EmailSend)
@@ -298,10 +366,48 @@ async def refine_draft(
             )
             .order_by(EmailSend.sent_at.asc())
         ))]
-        conversation_history = tuple(
-            {"subject": item.subject[:200], "body": item.body[:3000]}
-            for item in sent_messages[-10:]
-        )
+        if is_reply:
+            _bound_received(draft, root, db)
+            received_messages = list(
+                db.scalars(
+                    select(ReceivedGmailMessage)
+                    .where(
+                        ReceivedGmailMessage.owner_id == _owner_id(),
+                        ReceivedGmailMessage.conversation_id == root.id,
+                        ReceivedGmailMessage.gmail_thread_id == root.gmail_thread_id,
+                    )
+                    .order_by(ReceivedGmailMessage.received_at.asc())
+                )
+            )
+            combined = [
+                (
+                    item.sent_at or item.created_at,
+                    {
+                        "direction": "outgoing",
+                        "subject": item.subject[:200],
+                        "body": item.body[:3000],
+                    },
+                )
+                for item in sent_messages
+            ]
+            combined.extend(
+                (
+                    item.received_at,
+                    {
+                        "direction": "incoming",
+                        "subject": (item.subject or "")[:200],
+                        "body": clean_received_body(item.body)[:3000],
+                    },
+                )
+                for item in received_messages
+            )
+            combined.sort(key=lambda item: item[0])
+            conversation_history = tuple(item[1] for item in combined[-12:])
+        else:
+            conversation_history = tuple(
+                {"subject": item.subject[:200], "body": item.body[:3000]}
+                for item in sent_messages[-10:]
+            )
     context = _generation_context(
         payload=payload,
         profile=profile,
@@ -311,7 +417,8 @@ async def refine_draft(
         current_body=payload.body,
         refinement_instruction=payload.instruction,
         conversation_history=conversation_history,
-        is_followup=root is not None,
+        is_followup=root is not None and not is_reply,
+        is_reply=is_reply,
     )
     try:
         revision = await provider.generate_email(context)
@@ -357,7 +464,7 @@ def update_draft(
     draft_id: UUID,
     payload: EmailDraftUpdate,
     db: Annotated[Session, Depends(get_db)],
-) -> EmailDraft:
+) -> EmailDraftResponse:
     _owned_purpose(payload.purpose_id, db)
     _owned_resume(payload.resume_id, db)
     draft = _owned_draft(draft_id, db, for_update=True)
@@ -369,7 +476,7 @@ def update_draft(
     draft.body = payload.body
     _commit(db)
     db.refresh(draft)
-    return draft
+    return _draft_response(draft, db)
 
 
 @router.delete("/{draft_id}", status_code=204)

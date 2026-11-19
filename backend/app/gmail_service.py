@@ -6,7 +6,7 @@ from email.headerregistry import Address
 from email.message import EmailMessage
 from email.policy import SMTP
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
@@ -19,10 +19,14 @@ GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 GOOGLE_REVOCATION_ENDPOINT = "https://oauth2.googleapis.com/revoke"
 GOOGLE_USERINFO_ENDPOINT = "https://openidconnect.googleapis.com/v1/userinfo"
 GMAIL_SEND_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+GMAIL_THREAD_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}"
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_SCOPES = (
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/gmail.send",
+    GMAIL_SEND_SCOPE,
+    GMAIL_READONLY_SCOPE,
 )
 
 
@@ -35,6 +39,10 @@ class GmailConfigurationError(GmailServiceError):
 
 
 class GmailCredentialError(GmailServiceError):
+    pass
+
+
+class GmailReadPermissionError(GmailCredentialError):
     pass
 
 
@@ -389,6 +397,44 @@ class GmailService:
                 uncertain=True,
             )
         return GmailMessageResult(message_id=message_id, thread_id=thread_id)
+
+    async def get_thread(self, access_token: str, thread_id: str) -> dict[str, Any]:
+        """Read one already-known Gmail thread without searching or changing Gmail state."""
+        try:
+            response = await self._request(
+                "GET",
+                GMAIL_THREAD_ENDPOINT.format(thread_id=quote(thread_id, safe="")),
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"format": "full"},
+            )
+        except httpx.TimeoutException as exc:
+            raise GmailUpstreamError(
+                "Reading the Gmail thread timed out.", category="thread_timeout"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise GmailUpstreamError(
+                "The Gmail thread could not be read.", category="thread_transport"
+            ) from exc
+        if response.status_code == 401:
+            raise GmailCredentialError("The Gmail connection has expired or been revoked.")
+        if response.status_code == 403:
+            raise GmailReadPermissionError("Gmail read permission is required.")
+        if not response.is_success:
+            raise GmailUpstreamError(
+                "The Gmail thread could not be read.",
+                category=f"thread_http_{response.status_code}",
+            )
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise GmailUpstreamError(
+                "Gmail returned an unreadable thread.", category="thread_malformed"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GmailUpstreamError(
+                "Gmail returned an unreadable thread.", category="thread_malformed"
+            )
+        return payload
 
 
 def get_gmail_service() -> GmailService:

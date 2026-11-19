@@ -10,6 +10,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -76,6 +77,16 @@ class EmailPurpose(Base):
 
 class EmailDraft(Base):
     __tablename__ = "email_drafts"
+    __table_args__ = (
+        Index(
+            "uq_email_drafts_active_received_reply",
+            "reply_to_received_message_id",
+            unique=True,
+            postgresql_where=text(
+                "reply_to_received_message_id IS NOT NULL AND sent_at IS NULL AND deleted_at IS NULL"
+            ),
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     owner_id: Mapped[UUID] = mapped_column(index=True)
@@ -94,6 +105,19 @@ class EmailDraft(Base):
         ),
         nullable=True,
         index=True,
+    )
+    reply_to_received_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey(
+            "received_gmail_messages.id",
+            ondelete="RESTRICT",
+            name="fk_email_drafts_reply_to_received_message_id",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    reply_context_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
     )
     recipient_name: Mapped[str] = mapped_column(String(160))
     recipient_email: Mapped[str] = mapped_column(String(320))
@@ -193,6 +217,19 @@ class EmailSend(Base):
         ),
         nullable=True,
     )
+    reply_to_received_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey(
+            "received_gmail_messages.id",
+            ondelete="RESTRICT",
+            name="fk_email_sends_reply_to_received_message_id",
+            use_alter=True,
+        ),
+        nullable=True,
+        index=True,
+    )
+    reply_context_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(20), default="pending")
     draft_fingerprint: Mapped[str] = mapped_column(String(64))
     sender_email: Mapped[str] = mapped_column(String(320))
@@ -221,5 +258,34 @@ class EmailSend(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ReceivedGmailMessage(Base):
+    __tablename__ = "received_gmail_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "gmail_message_id", name="uq_received_gmail_messages_owner_message"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("email_sends.id", ondelete="RESTRICT"), index=True
+    )
+    gmail_message_id: Mapped[str] = mapped_column(String(255))
+    gmail_thread_id: Mapped[str] = mapped_column(String(255), index=True)
+    sender_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    sender_email: Mapped[str] = mapped_column(String(320))
+    recipient_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    subject: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    body: Mapped[str] = mapped_column(Text)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    in_reply_to: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
     )
 

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.gmail_service import (
+    GMAIL_READONLY_SCOPE,
     GMAIL_SCOPES,
     GmailCredentialError,
     GmailMessageResult,
@@ -76,6 +77,23 @@ class FakeOAuthService(FakeGmailService):
 
     async def revoke(self, token: str) -> None:
         return None
+
+
+class NoRefreshOAuthService(FakeOAuthService):
+    async def complete_oauth(self, code: str) -> OAuthGrant:
+        grant = await super().complete_oauth(code)
+        return OAuthGrant(
+            access_token=grant.access_token,
+            refresh_token=None,
+            expires_at=grant.expires_at,
+            scopes=grant.scopes,
+            google_subject=grant.google_subject,
+            email=grant.email,
+        )
+
+    def decrypt_token(self, value: str) -> str:
+        del value
+        return "preserved-refresh-token"
 
 
 class BlockingGmailService(FakeGmailService):
@@ -178,6 +196,40 @@ def test_oauth_state_is_hashed_one_time_and_tokens_are_encrypted(db_session: Ses
     assert request(
         "GET", f"/api/gmail/oauth/callback?state={state}&code=test-code", follow_redirects=False
     ).status_code == 400
+
+
+def test_oauth_reconnect_preserves_refresh_token_only_for_already_granted_scopes(
+    db_session: Session,
+) -> None:
+    connection = seed_connection(db_session)
+    service = NoRefreshOAuthService()
+    app.dependency_overrides[get_gmail_service] = lambda: service
+    authorize = request("GET", "/api/gmail/oauth/authorize").json()
+    state = parse_qs(urlparse(authorize["authorization_url"]).query)["state"][0]
+    callback = request(
+        "GET", f"/api/gmail/oauth/callback?state={state}&code=test-code", follow_redirects=False
+    )
+    assert callback.headers["location"].endswith("gmail=connected")
+    db_session.refresh(connection)
+    assert Fernet(service.key).decrypt(connection.encrypted_refresh_token.encode()).decode() == "preserved-refresh-token"
+
+
+def test_scope_upgrade_without_new_refresh_token_is_not_marked_read_authorized(
+    db_session: Session,
+) -> None:
+    connection = seed_connection(db_session)
+    connection.scopes = " ".join(scope for scope in GMAIL_SCOPES if scope != GMAIL_READONLY_SCOPE)
+    db_session.commit()
+    service = NoRefreshOAuthService()
+    app.dependency_overrides[get_gmail_service] = lambda: service
+    authorize = request("GET", "/api/gmail/oauth/authorize").json()
+    state = parse_qs(urlparse(authorize["authorization_url"]).query)["state"][0]
+    callback = request(
+        "GET", f"/api/gmail/oauth/callback?state={state}&code=test-code", follow_redirects=False
+    )
+    assert callback.headers["location"].endswith("gmail=missing_refresh")
+    db_session.refresh(connection)
+    assert GMAIL_READONLY_SCOPE not in connection.scopes.split()
 
 
 def test_mime_plain_text_and_pdf_attachment_preserve_content() -> None:

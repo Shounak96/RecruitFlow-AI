@@ -10,7 +10,7 @@ RecruitFlow AI is a cost-conscious, production-quality web application for AI-as
 - PostgreSQL is the system of record, accessed through SQLAlchemy 2.x and versioned with Alembic.
 - Local PostgreSQL runs in Docker Compose; application processes run on the host for a fast development loop.
 - Direct Google Gemini is the default local AI drafting provider through its HTTPS `generateContent` API. OpenRouter remains an explicitly selectable alternative. `AI_PROVIDER` selects the primary provider; optional fallback is disabled by default and never selects a paid OpenRouter route. API keys are never exposed to the frontend.
-- Gmail uses Google's authorization-code flow and the exact configured callback. Only `openid`, `userinfo.email`, and `gmail.send` are requested. The verified Google identity is the sender; encrypted refresh/access tokens remain backend-only.
+- Gmail uses Google's authorization-code flow and the exact configured callback. Only `openid`, `userinfo.email`, `gmail.send`, and `gmail.readonly` are requested. The verified Google identity is the sender; encrypted refresh/access tokens remain backend-only. Read access is used only for explicit synchronization of known RecruitFlow thread IDs.
 - Sending is a two-step server-enforced workflow: create an immutable review snapshot, then explicitly approve that snapshot. PostgreSQL state transitions and a partial unique constraint prevent duplicate dispatch of one approval. Confirmed Gmail message/thread IDs are retained; ambiguous post-dispatch failures become non-retryable `uncertain` records.
 - All configuration and credentials enter through environment variables. Secrets and uploaded resumes are never committed. Resume files use generated storage keys in an environment-configurable private directory outside public web roots.
 - The frontend and backend remain separate deployable applications. No queue or worker is needed for V1.
@@ -24,6 +24,8 @@ RecruitFlow AI is a cost-conscious, production-quality web application for AI-as
 4. **Gmail OAuth and human-approved sending (complete):** encrypted OAuth credentials, verified Gmail identity, disconnect/revoke, immutable final review, mandatory approval, RFC MIME sending with optional PDF, durable send states, duplicate protection, and confirmed message/thread metadata.
 5. **History and follow-ups (complete):** owner-scoped sent/uncertain history, immutable conversation details, grounded follow-up drafting/refinement, explicit approval for every follow-up, and same-thread Gmail sending.
 5.1. **Local deletion (complete):** owner-scoped draft removal and durable conversation tombstones that hide RecruitFlow records without changing Gmail messages or discarding send-safety metadata.
+5.2. **Manual Gmail reply sync (complete):** read-scope-aware reconnection, bounded user-triggered reads of known non-deleted Gmail threads, safe incoming-message parsing and persistence, and chronological History display with local new-reply state.
+5.3. **AI responses to received replies (complete):** grounded reply drafting from chronological sent/received context, optional user instructions, normal Compose editing/refinement, received-message-bound approval snapshots, and explicit same-thread Gmail sending.
 6. **Production hardening:** real authentication/authorization, rate limits, observability, accessibility, privacy/retention controls, end-to-end tests, and deployment runbooks.
 
 ## Explicit non-goals for V1
@@ -32,7 +34,7 @@ RecruitFlow AI is a cost-conscious, production-quality web application for AI-as
 - Autonomous outreach agents, queues, workflow engines, or extra services.
 - Non-Gmail providers, CRM/ATS integrations, campaign analytics, contact scraping, or lead discovery.
 - Paid AI or infrastructure dependencies as a requirement for local development.
-- Inbox reading, automatic retries, multi-user authentication, public deployment, scheduling, automatic/bulk sending, and follow-ups are not part of Milestone 4.
+- Global inbox scanning/search, background reply polling, automatic retries, multi-user authentication, public deployment, scheduling, and automatic/bulk sending.
 
 ## Implemented Milestone 2 contract
 
@@ -65,6 +67,9 @@ Resume validation checks the upload media type plus PDF header and end marker. S
 - `GET /api/history`
 - `GET /api/history/{conversation_id}`
 - `DELETE /api/history/{conversation_id}`
+- `POST /api/history/{conversation_id}/received/read`
+- `POST /api/gmail/replies/sync`
+- `POST /api/replies/generate`
 - `POST /api/followups/generate`
 
 ## Implemented Milestone 3 contract
@@ -95,7 +100,7 @@ Compose can request one free-text AI refinement of the current editor subject/bo
 
 ## Implemented Milestone 5 contract
 
-History is built only from immutable RecruitFlow send records; Gmail inbox/thread content is never read. Conversation summaries and details are owner-scoped and distinguish Gmail-confirmed `sent` messages from ambiguous `uncertain` attempts. Stored bodies and attachment filename/size metadata are displayed without private storage references. Search and pagination inputs are bounded.
+History starts from immutable RecruitFlow send records and may include safely persisted incoming replies from an explicit manual sync. Conversation summaries and details are owner-scoped and distinguish Gmail-confirmed `sent` messages, ambiguous `uncertain` attempts, and received messages. Stored bodies and attachment filename/size metadata are displayed without private storage references. Search and pagination inputs are bounded.
 
 Follow-up drafts are separate records linked to the original confirmed send. Generation uses the original message, prior confirmed RecruitFlow follow-ups, sender profile, purpose, relevant saved resume context, job context, and optional guidance. The shared prompt explicitly states that no inbound replies were read and forbids invented recipient interactions. Follow-up recipient and normalized `Re:` subject are locked to the conversation; editing, refinement, attachment selection, save, immutable review, and explicit approval reuse the existing Compose workflow.
 
@@ -106,4 +111,20 @@ New outgoing messages receive an actual RFC Message-ID header that is stored wit
 Draft and History delete actions remove records from normal RecruitFlow lists and direct-access APIs only; they never call Gmail or delete Gmail messages. Drafts use a persistent `deleted_at` tombstone, and any pending review for a deleted draft becomes stale. Sent, uncertain, failed, and stale send records retain their immutable snapshots, Gmail identifiers, idempotency metadata, and audit state.
 
 Deleting a History conversation transactionally tombstones its root send, RecruitFlow follow-ups, and all related drafts. Active `sending` conversations cannot be deleted. Deleted conversations cannot generate follow-ups or be approved for sending, and all normal draft/history endpoints exclude their tombstoned records. The root send tombstone is durable and must be honored by any future Gmail synchronization so a locally deleted conversation is not resurrected. Local deletion remains owner-scoped under the existing single local-owner boundary and has no effect on Gmail.
+
+## Implemented V2.2 manual reply-sync contract
+
+Gmail OAuth now also requests `gmail.readonly`; connections whose stored grant lacks that scope remain valid for sending but are explicitly reported as needing reauthorization before reply sync. Refresh-token rotation preserves the existing encrypted refresh token when Google omits a replacement, but a send-only token is never reused to claim a read-scope upgrade.
+
+Reply sync occurs only when the user selects **Sync Replies**. One request reads at most 25 Gmail thread IDs already attached to confirmed, non-deleted RecruitFlow root sends by calling `threads.get(format=full)`. It performs no Gmail search, inbox listing, label change, deletion, attachment download, read-state mutation, polling, webhook, or background work. Per-thread failures are isolated and safely reported; repeated syncs are idempotent through a PostgreSQL owner/message uniqueness constraint.
+
+Only messages in the expected thread, from the saved recruiter address solely to the verified Gmail identity, and not matching any stored RecruitFlow outgoing Gmail message ID are accepted. MIME text/plain is preferred; multipart/alternative and HTML-only content are converted to bounded plain text without rendering HTML, loading remote content, or downloading attachments. History merges received and sent records chronologically and tracks seen/new state only in RecruitFlow. Root conversation tombstones exclude deleted threads from selection and prevent locally deleted conversations from being resurrected. Synced content reaches AI only through the explicit V2.3 reply-generation or refinement actions described below.
+
+## Implemented V2.3 AI reply contract
+
+History exposes **Generate AI Reply** only when an active conversation has an eligible received message. The request accepts optional free-text instructions and sends the configured Gemini/OpenRouter provider a bounded chronological view of RecruitFlow's outgoing messages and safely persisted incoming replies. Incoming bodies, user instructions, resume text, purposes, and job descriptions remain untrusted model data. The shared prompt forbids fabricated availability, commitments, compensation expectations, interview outcomes, referrals, attachments, job facts, and recruiter statements; missing facts should produce a concise clarification instead. Structured subject/body validation and optional provider fallback remain unchanged.
+
+Each reply draft stores the exact received-message ID it answers and opens in the existing Compose editor. The application, not AI output, fixes the recipient to the latest permitted inbound sender and normalizes the thread subject. Reply drafts support normal manual edits, persistence, proposal-only AI refinement, attachment selection, immutable review, and explicit approval. Generation, refinement, saving, and review preparation never send email.
+
+The send review snapshots the received-message reference and a SHA-256 context fingerprint. Review and dispatch revalidate the live root tombstone, authenticated sender, Gmail thread, latest inbound ordering, participant identities, recipient, inbound content, latest outgoing parent, draft fingerprint, and attachment. A newer synced reply immediately makes a pending reply review stale. Confirmed replies use the original Gmail `threadId`, the inbound RFC Message-ID as `In-Reply-To`, accumulated stored RFC IDs in `References`, and the existing duplicate/concurrent-send and uncertain-delivery safeguards. One non-deleted draft or confirmed/uncertain send may respond to a given inbound message; subsequent replies require a newer synced message.
 

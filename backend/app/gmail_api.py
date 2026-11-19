@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.database import get_db
 from app.gmail_service import (
+    GMAIL_READONLY_SCOPE,
     GMAIL_SCOPES,
     GmailConfigurationError,
     GmailCredentialError,
@@ -29,6 +30,7 @@ from app.models import (
     EmailSend,
     GmailConnection,
     GmailOAuthState,
+    ReceivedGmailMessage,
     Resume,
     SenderProfile,
 )
@@ -80,6 +82,12 @@ def _draft_fingerprint(draft: EmailDraft) -> str:
             "attach_resume": draft.attach_resume,
             "resume_id": str(draft.resume_id) if draft.resume_id else None,
             "conversation_id": str(draft.conversation_id) if draft.conversation_id else None,
+            "reply_to_received_message_id": (
+                str(draft.reply_to_received_message_id)
+                if draft.reply_to_received_message_id
+                else None
+            ),
+            "reply_context_fingerprint": draft.reply_context_fingerprint,
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -130,6 +138,44 @@ def _conversation_messages(root: EmailSend, db: Session) -> list[EmailSend]:
     return [root, *followups]
 
 
+def _received_fingerprint(message: ReceivedGmailMessage) -> str:
+    canonical = json.dumps(
+        {
+            "id": str(message.id),
+            "gmail_message_id": message.gmail_message_id,
+            "gmail_thread_id": message.gmail_thread_id,
+            "sender_email": message.sender_email,
+            "recipient_email": message.recipient_email,
+            "subject": message.subject,
+            "body": message.body,
+            "received_at": message.received_at.isoformat(),
+            "rfc_message_id": message.rfc_message_id,
+            "in_reply_to": message.in_reply_to,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _received_messages(root: EmailSend, db: Session) -> list[ReceivedGmailMessage]:
+    return list(
+        db.scalars(
+            select(ReceivedGmailMessage)
+            .where(
+                ReceivedGmailMessage.owner_id == _owner_id(),
+                ReceivedGmailMessage.conversation_id == root.id,
+                ReceivedGmailMessage.gmail_thread_id == root.gmail_thread_id,
+            )
+            .order_by(
+                ReceivedGmailMessage.received_at.asc(),
+                ReceivedGmailMessage.created_at.asc(),
+            )
+        )
+    )
+
+
 async def _valid_access_token(
     connection: GmailConnection,
     db: Session,
@@ -167,6 +213,16 @@ def gmail_status(db: Annotated[Session, Depends(get_db)]) -> GmailStatusResponse
     return GmailStatusResponse(
         connected=bool(connection and connection.is_valid),
         email=connection.email if connection else None,
+        read_authorized=bool(
+            connection
+            and connection.is_valid
+            and GMAIL_READONLY_SCOPE in connection.scopes.split()
+        ),
+        reauthorization_required=bool(
+            connection
+            and connection.is_valid
+            and GMAIL_READONLY_SCOPE not in connection.scopes.split()
+        ),
     )
 
 
@@ -239,7 +295,13 @@ async def gmail_oauth_callback(
 
     connection = _connection(db)
     refresh_token = grant.refresh_token
-    if refresh_token is None and connection is not None:
+    if (
+        refresh_token is None
+        and connection is not None
+        and connection.google_subject == grant.google_subject
+        and connection.email.lower() == grant.email.lower()
+        and grant.scopes.issubset(set(connection.scopes.split()))
+    ):
         try:
             refresh_token = service.decrypt_token(connection.encrypted_refresh_token)
         except GmailCredentialError:
@@ -358,6 +420,8 @@ def create_review(
     intended_thread_id = None
     in_reply_to = None
     references_header = None
+    reply_to_received_message_id = None
+    reply_context_fingerprint = None
     if draft.conversation_id is not None:
         root = db.scalar(
             select(EmailSend).where(
@@ -383,13 +447,49 @@ def create_review(
         parent = messages[-1]
         if draft.subject != _reply_subject(root.subject):
             raise HTTPException(status_code=409, detail="The follow-up subject must match its conversation.")
+        received = None
+        if draft.reply_to_received_message_id is not None:
+            received_messages = _received_messages(root, db)
+            received = next(
+                (
+                    item
+                    for item in received_messages
+                    if item.id == draft.reply_to_received_message_id
+                ),
+                None,
+            )
+            if (
+                received is None
+                or received_messages[-1].id != received.id
+                or received.sender_email.lower() != root.recipient_email.lower()
+                or (received.recipient_email or "").lower() != connection.email.lower()
+                or draft.recipient_email.lower() != received.sender_email.lower()
+                or draft.reply_context_fingerprint != _received_fingerprint(received)
+                or not received.rfc_message_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The received-message context changed. Generate a new AI reply.",
+                )
+            reply_to_received_message_id = received.id
+            reply_context_fingerprint = _received_fingerprint(received)
+        elif draft.recipient_email.lower() != root.recipient_email.lower():
+            raise HTTPException(status_code=409, detail="The follow-up recipient changed.")
         conversation_id = root.id
         parent_send_id = parent.id
         intended_thread_id = root.gmail_thread_id
-        in_reply_to = parent.rfc_message_id
-        references_header = " ".join(
+        in_reply_to = received.rfc_message_id if received is not None else parent.rfc_message_id
+        reference_ids = [
             message.rfc_message_id for message in messages if message.rfc_message_id
-        )
+        ]
+        if received is not None:
+            reference_ids.extend(
+                item.rfc_message_id
+                for item in received_messages
+                if item.rfc_message_id
+                and item.received_at <= received.received_at
+            )
+        references_header = " ".join(dict.fromkeys(reference_ids))
 
     sender_domain = connection.email.rpartition("@")[2] or None
     rfc_message_id = make_msgid(domain=sender_domain)
@@ -399,6 +499,8 @@ def create_review(
         draft_id=draft.id,
         conversation_id=conversation_id,
         parent_send_id=parent_send_id,
+        reply_to_received_message_id=reply_to_received_message_id,
+        reply_context_fingerprint=reply_context_fingerprint,
         status="pending",
         draft_fingerprint=_draft_fingerprint(draft),
         sender_email=connection.email,
@@ -484,6 +586,34 @@ async def approve_and_send(
             send.status = "stale"
             _commit(db)
             raise HTTPException(status_code=409, detail="The conversation changed after review.")
+        if send.reply_to_received_message_id is not None:
+            received_messages = _received_messages(root, db)
+            received = next(
+                (
+                    item
+                    for item in received_messages
+                    if item.id == send.reply_to_received_message_id
+                ),
+                None,
+            )
+            if (
+                received is None
+                or not received_messages
+                or received_messages[-1].id != received.id
+                or draft is None
+                or draft.reply_to_received_message_id != received.id
+                or draft.reply_context_fingerprint != send.reply_context_fingerprint
+                or send.recipient_email.lower() != received.sender_email.lower()
+                or received.sender_email.lower() != root.recipient_email.lower()
+                or (received.recipient_email or "").lower() != connection.email.lower()
+                or send.reply_context_fingerprint != _received_fingerprint(received)
+            ):
+                send.status = "stale"
+                _commit(db)
+                raise HTTPException(
+                    status_code=409,
+                    detail="The received-message context changed after review.",
+                )
     if draft is None or draft.sent_at is not None or _draft_fingerprint(draft) != send.draft_fingerprint:
         send.status = "stale"
         _commit(db)

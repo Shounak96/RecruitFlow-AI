@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     ai_fallback_provider: Literal["gemini", "openrouter"] = "openrouter"
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-3.5-flash-lite"
-    gemini_timeout_seconds: float = 30.0
+    gemini_timeout_seconds: float = 45.0
     openrouter_api_key: SecretStr | None = None
     openrouter_model: str | None = None
     openrouter_timeout_seconds: float = 30.0

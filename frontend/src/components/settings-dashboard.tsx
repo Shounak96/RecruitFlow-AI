@@ -267,7 +267,7 @@ export function SettingsDashboard() {
           <div>
             <p className="font-semibold text-slate-900">Verified Gmail identity</p>
             <p className="mt-1 text-sm text-slate-600">{profile?.gmail_connected ? profile.gmail_email : "Not connected"}</p>
-            <p className="mt-1 text-xs text-slate-500">RecruitFlow requests identity and Gmail send access only. A typed sender address is never treated as verified.</p>
+            <p className="mt-1 text-xs text-slate-500">RecruitFlow requests identity, Gmail send, and read-only access for manual reply sync. A typed sender address is never treated as verified.</p>
           </div>
           {profile?.gmail_connected ? (
             <button type="button" className="button-danger shrink-0" disabled={busy === "gmail"} onClick={() => void disconnectGmail()}>{busy === "gmail" ? "Disconnecting…" : "Disconnect Gmail"}</button>

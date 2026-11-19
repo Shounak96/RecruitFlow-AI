@@ -15,8 +15,10 @@ RecruitFlow AI is a local-first web application for creating personalized recrui
 - Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
 - Review an immutable server-side snapshot and explicitly approve every individual send. Draft generation, saving, refinement, and review preparation never send email.
 - Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
+- Manually sync recruiter replies only from Gmail thread IDs already saved by RecruitFlow, then view incoming and outgoing messages chronologically with local new-reply indicators.
+- Generate a grounded AI response to the latest eligible recruiter reply, edit or refine it in Compose, and send it in the same Gmail thread only after the normal final review and explicit approval.
 - Remove drafts or entire conversations from RecruitFlow locally without deleting or changing messages in Gmail.
-- Keep inbox access, automated outreach, scheduling, and background sending out of scope.
+- Keep global inbox scanning, automated outreach, scheduling, and background sending out of scope.
 
 ## Architecture
 
@@ -33,7 +35,7 @@ flowchart LR
 
     B --> GS[Gmail service]
     GS --> GO[Google OAuth and UserInfo]
-    GS --> GM[Gmail users.messages.send]
+    GS --> GM[Gmail send and known-thread read APIs]
 
     DB -->|Profiles, purposes, drafts,<br/>reviews, sends, history| B
     FS -->|Resume text or approved attachment| B
@@ -49,7 +51,7 @@ AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI 
 | Backend | Python 3.12, FastAPI, Pydantic Settings, Uvicorn, HTTPX |
 | Data | PostgreSQL 16, SQLAlchemy 2, Psycopg 3, Alembic |
 | AI | Google Gemini `generateContent`, OpenRouter chat completions, PyPDF text extraction |
-| Email | Google OAuth 2.0, OpenID Connect user info, Gmail `users.messages.send`, Python MIME tooling |
+| Email | Google OAuth 2.0, OpenID Connect user info, Gmail send and known-thread read APIs, Python MIME tooling |
 | Security | Fernet token encryption, hashed OAuth state, private generated resume storage keys |
 | Testing | pytest with PostgreSQL integration tests; TypeScript type checking and Next.js production builds |
 
@@ -59,11 +61,12 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 
 - **Grounded, structured AI output:** the shared prompt treats resume text, job descriptions, purposes, and refinement guidance as untrusted source data. Both providers must return a bounded object containing exactly `subject` and `body`, which is validated before persistence.
 - **Controlled provider failover:** failover is disabled by default. When enabled with a distinct provider, the backend tries it exactly once after a primary-provider rate limit, transport timeout, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free.
-- **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, and `gmail.send`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend.
+- **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, `gmail.send`, and `gmail.readonly`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend. Existing send-only connections are never treated as read-authorized.
 - **Server-enforced approval:** preparing a review snapshots the authenticated sender, recipient, subject, body, draft fingerprint, and attachment metadata. The attachment size and SHA-256 digest are checked again at dispatch. Any intervening draft or conversation change makes the review stale.
 - **Duplicate-send prevention:** PostgreSQL uniqueness constraints, row locks, and durable `pending -> sending -> sent|failed|uncertain` transitions prevent the same approval from being dispatched twice by concurrent requests.
 - **Conservative delivery state:** Gmail confirmation is required before a send becomes `sent`. An ambiguous timeout or transport failure after dispatch becomes non-retryable `uncertain`; the UI instructs the user to check Gmail Sent mail instead of blindly retrying.
-- **Threaded follow-ups without inbox access:** follow-ups use only RecruitFlow's stored outbound messages. The backend retains Gmail thread IDs and RFC `Message-ID` values, supplies `In-Reply-To` and `References`, and rejects follow-ups when same-thread delivery cannot be safely established.
+- **Threaded follow-ups and bounded reply sync:** follow-ups retain Gmail thread IDs and RFC `Message-ID` values, supply `In-Reply-To` and `References`, and are rejected when same-thread delivery cannot be safely established. Reply sync is manual, reads at most 25 known non-deleted RecruitFlow threads per request, stores bounded plain text, and never searches the inbox, downloads attachments, changes labels, or marks Gmail messages read.
+- **Inbound-context-bound AI replies:** the latest eligible received-message ID and a content fingerprint are bound to the immutable send review. Newer, changed, removed, cross-thread, self-authored, alias, or unsupported group context is rejected. The recipient comes from validated Gmail state, never AI output, and every response still requires manual approval.
 - **Durable local deletion:** draft and conversation tombstones hide deleted records from normal APIs while preserving send snapshots, Gmail thread identifiers, and duplicate-send safeguards. Pending reviews become stale, active dispatches cannot be deleted, and no delete operation calls Gmail. Future synchronization must honor the root conversation tombstone.
 
 ## Local setup on Windows
@@ -131,6 +134,9 @@ RecruitFlow requests only:
 - `openid`
 - `https://www.googleapis.com/auth/userinfo.email`
 - `https://www.googleapis.com/auth/gmail.send`
+- `https://www.googleapis.com/auth/gmail.readonly`
+
+An existing Gmail connection created before reply sync was added must be reconnected from History so Google can grant `gmail.readonly`. RecruitFlow continues to distinguish a valid send-only connection from one authorized to read known threads.
 
 Generate a Fernet key once:
 
@@ -198,13 +204,13 @@ npm.cmd run build
 Set-Location ..
 ```
 
-Latest verified backend result: **111 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
+Latest verified backend result: **141 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
 
 ## Security limitations
 
 RecruitFlow currently uses one server-selected `LOCAL_OWNER_ID`. This prevents clients from choosing an owner but is **not authentication or multi-tenant isolation**. The application is intended for local development on `127.0.0.1` and is not suitable for public deployment as implemented.
 
-A public deployment would require real authentication and session authorization, per-request tenant isolation, HTTPS, production secret/key management and rotation, CSRF and cookie review, abuse controls, rate limiting, audit and retention policies, OAuth consent/security review, and end-to-end security testing. The application also does not read Gmail inbox content, detect replies, or determine whether an uncertain send was delivered.
+A public deployment would require real authentication and session authorization, per-request tenant isolation, HTTPS, production secret/key management and rotation, CSRF and cookie review, abuse controls, rate limiting, audit and retention policies, OAuth consent/security review, and end-to-end security testing. Manual sync stores bounded reply text locally for known RecruitFlow threads and AI reply generation sends the selected bounded conversation context to the configured provider. The app does not perform a global inbox scan, download attachments, detect replies in the background, or determine whether an uncertain send was delivered.
 
 ## Roadmap
 

@@ -144,6 +144,8 @@ class EmailDraftResponse(EmailDraftUpdate):
     status: str = "not_sent"
     refinement_allowed: bool = True
     conversation_id: UUID | None = None
+    reply_to_received_message_id: UUID | None = None
+    draft_kind: Literal["initial", "follow_up", "reply"] = "initial"
 
 
 class EmailRefinementRequest(EmailDraftUpdate):
@@ -166,6 +168,8 @@ class EmailRevisionResponse(BaseModel):
 class GmailStatusResponse(BaseModel):
     connected: bool
     email: str | None = None
+    read_authorized: bool = False
+    reauthorization_required: bool = False
 
 
 class GmailAuthorizationResponse(BaseModel):
@@ -232,6 +236,21 @@ class FollowupGenerationRequest(BaseModel):
         return value or None
 
 
+class ReplyGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: UUID
+    instructions: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("instructions")
+    @classmethod
+    def clean_instructions(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
+
+
 class HistoryConversationItem(BaseModel):
     id: UUID
     draft_id: UUID
@@ -244,19 +263,22 @@ class HistoryConversationItem(BaseModel):
     follow_up_count: int
     uncertain_follow_up_count: int
     can_follow_up: bool
+    unread_reply_count: int
 
 
 class HistoryMessage(BaseModel):
     id: UUID
-    draft_id: UUID
-    kind: Literal["original", "follow_up"]
+    draft_id: UUID | None
+    kind: Literal["original", "follow_up", "received"]
+    direction: Literal["outgoing", "incoming"]
     sender_name: str | None
     sender_email: str
     recipient_email: str
     subject: str
     body: str
+    full_body: str | None = None
     timestamp: datetime
-    delivery_state: Literal["sent", "uncertain"]
+    delivery_state: Literal["sent", "uncertain"] | None
     attachment_filename: str | None
     attachment_size_bytes: int | None
     gmail_message_id: str | None
@@ -270,6 +292,26 @@ class ConversationDetail(BaseModel):
     company: str | None
     subject: str
     can_follow_up: bool
+    unread_reply_count: int
+    has_received_messages: bool
+    can_reply: bool
+    reply_eligibility: Literal[
+        "eligible",
+        "no_received_message",
+        "draft_exists",
+        "already_replied",
+        "active_send",
+        "gmail_unavailable",
+        "unsupported_inbound",
+    ]
+    reply_draft_id: UUID | None = None
     messages: list[HistoryMessage]
+
+
+class GmailReplySyncResponse(BaseModel):
+    threads_checked: int
+    threads_failed: int
+    new_messages: int
+    partial_failure: bool
 
 
