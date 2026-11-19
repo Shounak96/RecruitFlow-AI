@@ -23,6 +23,7 @@ RecruitFlow AI is a cost-conscious, production-quality web application for AI-as
 3. **Compose and AI drafting (complete):** bounded PDF text extraction, configurable direct Gemini/OpenRouter integration, grounded structured generation, editable persistent drafts, regeneration, and responsive Compose UI.
 4. **Gmail OAuth and human-approved sending (complete):** encrypted OAuth credentials, verified Gmail identity, disconnect/revoke, immutable final review, mandatory approval, RFC MIME sending with optional PDF, durable send states, duplicate protection, and confirmed message/thread metadata.
 5. **History and follow-ups (complete):** owner-scoped sent/uncertain history, immutable conversation details, grounded follow-up drafting/refinement, explicit approval for every follow-up, and same-thread Gmail sending.
+5.1. **Local deletion (complete):** owner-scoped draft removal and durable conversation tombstones that hide RecruitFlow records without changing Gmail messages or discarding send-safety metadata.
 6. **Production hardening:** real authentication/authorization, rate limits, observability, accessibility, privacy/retention controls, end-to-end tests, and deployment runbooks.
 
 ## Explicit non-goals for V1
@@ -63,6 +64,7 @@ Resume validation checks the upload media type plus PDF header and end marker. S
 - `GET /api/gmail/history`
 - `GET /api/history`
 - `GET /api/history/{conversation_id}`
+- `DELETE /api/history/{conversation_id}`
 - `POST /api/followups/generate`
 
 ## Implemented Milestone 3 contract
@@ -98,4 +100,10 @@ History is built only from immutable RecruitFlow send records; Gmail inbox/threa
 Follow-up drafts are separate records linked to the original confirmed send. Generation uses the original message, prior confirmed RecruitFlow follow-ups, sender profile, purpose, relevant saved resume context, job context, and optional guidance. The shared prompt explicitly states that no inbound replies were read and forbids invented recipient interactions. Follow-up recipient and normalized `Re:` subject are locked to the conversation; editing, refinement, attachment selection, save, immutable review, and explicit approval reuse the existing Compose workflow.
 
 New outgoing messages receive an actual RFC Message-ID header that is stored with the send snapshot. A follow-up supplies the original Gmail `threadId`, stored RFC `In-Reply-To`, and accumulated `References`; Gmail resource IDs are never used as RFC Message-ID values. Only one pending/sending/uncertain follow-up may exist per conversation. Parent/thread/account changes make approval stale, and a returned Gmail thread mismatch becomes non-retryable `uncertain`. Messages sent before RFC Message-ID storage remain visible but cannot be followed up with guaranteed threading.
+
+## Implemented V2.1 local deletion contract
+
+Draft and History delete actions remove records from normal RecruitFlow lists and direct-access APIs only; they never call Gmail or delete Gmail messages. Drafts use a persistent `deleted_at` tombstone, and any pending review for a deleted draft becomes stale. Sent, uncertain, failed, and stale send records retain their immutable snapshots, Gmail identifiers, idempotency metadata, and audit state.
+
+Deleting a History conversation transactionally tombstones its root send, RecruitFlow follow-ups, and all related drafts. Active `sending` conversations cannot be deleted. Deleted conversations cannot generate follow-ups or be approved for sending, and all normal draft/history endpoints exclude their tombstoned records. The root send tombstone is durable and must be honored by any future Gmail synchronization so a locally deleted conversation is not resurrected. Local deletion remains owner-scoped under the existing single local-owner boundary and has no effect on Gmail.
 

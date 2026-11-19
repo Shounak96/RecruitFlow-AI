@@ -233,7 +233,12 @@ def test_review_approval_send_persistence_duplicate_guard_and_read_only(
     assert db_session.get(EmailDraft, draft.id).sent_at is not None
     history = request("GET", "/api/gmail/history").json()
     assert history[0]["gmail_thread_id"] == "thread-456"
-    assert request("DELETE", f"/api/drafts/{draft.id}").status_code == 409
+    assert request("DELETE", f"/api/drafts/{draft.id}").status_code == 204
+    assert request("GET", f"/api/drafts/{draft.id}").status_code == 404
+    assert request("GET", "/api/gmail/history").json()[0]["gmail_thread_id"] == "thread-456"
+    db_session.expire_all()
+    assert db_session.get(EmailSend, snapshot["id"]).status == "sent"
+    assert db_session.get(EmailDraft, draft.id).deleted_at is not None
 
 
 def test_draft_edit_invalidates_review_and_blocks_send(db_session: Session) -> None:

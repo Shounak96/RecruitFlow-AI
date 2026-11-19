@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
@@ -51,10 +52,17 @@ def _owned_resume(resume_id: UUID | None, db: Session) -> Resume | None:
     return resume
 
 
-def _owned_draft(draft_id: UUID, db: Session, *, for_update: bool = False) -> EmailDraft:
-    statement = select(EmailDraft).where(
-        EmailDraft.id == draft_id, EmailDraft.owner_id == _owner_id()
-    )
+def _owned_draft(
+    draft_id: UUID,
+    db: Session,
+    *,
+    for_update: bool = False,
+    include_deleted: bool = False,
+) -> EmailDraft:
+    conditions = [EmailDraft.id == draft_id, EmailDraft.owner_id == _owner_id()]
+    if not include_deleted:
+        conditions.append(EmailDraft.deleted_at.is_(None))
+    statement = select(EmailDraft).where(*conditions)
     if for_update:
         statement = statement.with_for_update()
     draft = db.scalar(statement)
@@ -114,6 +122,7 @@ def _followup_root(draft: EmailDraft, db: Session) -> EmailSend | None:
             EmailSend.owner_id == _owner_id(),
             EmailSend.conversation_id.is_(None),
             EmailSend.status == "sent",
+            EmailSend.deleted_at.is_(None),
         )
     )
     if root is None:
@@ -285,6 +294,7 @@ async def refine_draft(
                 EmailSend.owner_id == _owner_id(),
                 EmailSend.conversation_id == root.id,
                 EmailSend.status == "sent",
+                EmailSend.deleted_at.is_(None),
             )
             .order_by(EmailSend.sent_at.asc())
         ))]
@@ -313,6 +323,7 @@ async def refine_draft(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except AIMalformedResponseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _owned_draft(draft_id, db)
     return EmailRevisionResponse(
         subject=_reply_subject(root.subject) if root is not None else revision.subject,
         body=revision.body,
@@ -324,7 +335,10 @@ def list_drafts(db: Annotated[Session, Depends(get_db)]) -> list[EmailDraftRespo
     drafts = list(
         db.scalars(
             select(EmailDraft)
-            .where(EmailDraft.owner_id == _owner_id())
+            .where(
+                EmailDraft.owner_id == _owner_id(),
+                EmailDraft.deleted_at.is_(None),
+            )
             .order_by(EmailDraft.updated_at.desc())
         )
     )
@@ -360,9 +374,28 @@ def update_draft(
 
 @router.delete("/{draft_id}", status_code=204)
 def delete_draft(draft_id: UUID, db: Annotated[Session, Depends(get_db)]) -> Response:
-    draft = _owned_draft(draft_id, db, for_update=True)
-    _ensure_unsent(draft, db)
-    db.delete(draft)
+    draft = _owned_draft(draft_id, db, for_update=True, include_deleted=True)
+    if draft.deleted_at is not None:
+        return Response(status_code=204)
+    sends = list(
+        db.scalars(
+            select(EmailSend)
+            .where(
+                EmailSend.draft_id == draft.id,
+                EmailSend.owner_id == _owner_id(),
+            )
+            .with_for_update()
+        )
+    )
+    if any(send.status == "sending" for send in sends):
+        raise HTTPException(
+            status_code=409,
+            detail="This draft cannot be deleted while Gmail delivery is in progress.",
+        )
+    for send in sends:
+        if send.status == "pending":
+            send.status = "stale"
+    draft.deleted_at = datetime.now(timezone.utc)
     _commit(db)
     return Response(status_code=204)
 

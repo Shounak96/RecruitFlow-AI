@@ -295,7 +295,11 @@ def create_review(
     connection = _connection(db, require_valid=True)
     draft = db.scalar(
         select(EmailDraft)
-        .where(EmailDraft.id == draft_id, EmailDraft.owner_id == _owner_id())
+        .where(
+            EmailDraft.id == draft_id,
+            EmailDraft.owner_id == _owner_id(),
+            EmailDraft.deleted_at.is_(None),
+        )
         .with_for_update()
     )
     if draft is None:
@@ -360,6 +364,7 @@ def create_review(
                 EmailSend.id == draft.conversation_id,
                 EmailSend.owner_id == _owner_id(),
                 EmailSend.conversation_id.is_(None),
+                EmailSend.deleted_at.is_(None),
             )
         )
         if (
@@ -443,7 +448,11 @@ async def approve_and_send(
         raise HTTPException(status_code=404, detail="Send review not found.")
     draft = db.scalar(
         select(EmailDraft)
-        .where(EmailDraft.id == send.draft_id, EmailDraft.owner_id == _owner_id())
+        .where(
+            EmailDraft.id == send.draft_id,
+            EmailDraft.owner_id == _owner_id(),
+            EmailDraft.deleted_at.is_(None),
+        )
         .with_for_update()
     )
     send = db.scalar(
@@ -603,7 +612,11 @@ def send_history(
 ) -> list[GmailSendHistoryResponse]:
     sends = db.scalars(
         select(EmailSend)
-        .where(EmailSend.owner_id == _owner_id(), EmailSend.status == "sent")
+        .where(
+            EmailSend.owner_id == _owner_id(),
+            EmailSend.status == "sent",
+            EmailSend.deleted_at.is_(None),
+        )
         .order_by(EmailSend.sent_at.desc())
     )
     return [

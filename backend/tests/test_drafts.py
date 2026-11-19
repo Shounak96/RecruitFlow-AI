@@ -14,7 +14,7 @@ from app.ai_provider import (
 )
 from app.config import get_settings
 from app.main import app
-from app.models import EmailDraft, EmailPurpose, Resume, SenderProfile
+from app.models import EmailDraft, EmailPurpose, EmailSend, Resume, SenderProfile
 from app.resume_text import ResumeExtractionError
 from tests.api_client import request
 
@@ -114,7 +114,91 @@ def test_generate_persists_grounded_context_and_draft_crud(db_session: Session) 
     assert len(request("GET", "/api/drafts").json()) == 1
 
     assert request("DELETE", f"/api/drafts/{draft_id}").status_code == 204
+    assert request("DELETE", f"/api/drafts/{draft_id}").status_code == 204
     assert request("GET", f"/api/drafts/{draft_id}").status_code == 404
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft_id).deleted_at is not None
+
+
+def test_delete_draft_stales_review_and_blocks_all_draft_actions(
+    db_session: Session,
+) -> None:
+    purpose = seed_context(db_session)
+    draft = EmailDraft(
+        owner_id=get_settings().local_owner_id,
+        purpose_id=purpose.id,
+        recipient_name="Taylor",
+        recipient_email="taylor@example.com",
+        attach_resume=False,
+        subject="Draft to remove",
+        body=GENERATED_BODY,
+    )
+    db_session.add(draft)
+    db_session.flush()
+    review = EmailSend(
+        owner_id=draft.owner_id,
+        draft_id=draft.id,
+        status="pending",
+        draft_fingerprint="f" * 64,
+        sender_email="verified@example.com",
+        recipient_email=draft.recipient_email,
+        subject=draft.subject,
+        body=draft.body,
+    )
+    db_session.add(review)
+    db_session.commit()
+
+    assert request("DELETE", f"/api/drafts/{draft.id}").status_code == 204
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft.id).deleted_at is not None
+    assert db_session.get(EmailSend, review.id).status == "stale"
+    assert request("GET", "/api/drafts").json() == []
+    assert request("GET", f"/api/drafts/{draft.id}").status_code == 404
+
+    update_payload = generation_payload(purpose.id)
+    update_payload.update({"subject": "Changed", "body": GENERATED_BODY})
+    assert request("PUT", f"/api/drafts/{draft.id}", json=update_payload).status_code == 404
+    provider = FakeProvider()
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    assert request(
+        "POST",
+        "/api/drafts/generate",
+        json=generation_payload(purpose.id, draft_id=str(draft.id)),
+    ).status_code == 404
+    assert provider.contexts == []
+
+
+def test_delete_draft_rejects_active_dispatch(db_session: Session) -> None:
+    purpose = seed_context(db_session)
+    draft = EmailDraft(
+        owner_id=get_settings().local_owner_id,
+        purpose_id=purpose.id,
+        recipient_name="Taylor",
+        recipient_email="taylor@example.com",
+        attach_resume=False,
+        subject="Sending draft",
+        body=GENERATED_BODY,
+    )
+    db_session.add(draft)
+    db_session.flush()
+    db_session.add(
+        EmailSend(
+            owner_id=draft.owner_id,
+            draft_id=draft.id,
+            status="sending",
+            draft_fingerprint="f" * 64,
+            sender_email="verified@example.com",
+            recipient_email=draft.recipient_email,
+            subject=draft.subject,
+            body=draft.body,
+        )
+    )
+    db_session.commit()
+
+    response = request("DELETE", f"/api/drafts/{draft.id}")
+    assert response.status_code == 409
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft.id).deleted_at is None
 
 
 def test_draft_owner_isolation(db_session: Session) -> None:
@@ -133,6 +217,7 @@ def test_draft_owner_isolation(db_session: Session) -> None:
     assert request("GET", "/api/drafts").json() == []
     assert request("GET", f"/api/drafts/{other.id}").status_code == 404
     assert request("DELETE", f"/api/drafts/{other.id}").status_code == 404
+    assert request("DELETE", "/api/drafts/not-a-uuid").status_code == 422
 
 
 @pytest.mark.parametrize(

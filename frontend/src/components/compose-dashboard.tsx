@@ -56,6 +56,7 @@ export function ComposeDashboard() {
   const [form, setForm] = useState(emptyForm);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"generate" | "refine" | "save" | "delete" | "review" | "send" | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -211,15 +212,19 @@ export function ComposeDashboard() {
     setRevision(null); setSuccess("AI revision discarded. Your current draft was not changed.");
   }
 
-  async function remove() {
-    if (!currentId || busy || !window.confirm("Delete this draft? This cannot be undone.")) return;
-    setBusy("delete");
+  async function removeDraft(draftId: string) {
+    if (busy || !window.confirm("Remove this draft from RecruitFlow? It will be permanently hidden in RecruitFlow, but no email will be deleted or changed in Gmail.")) return;
+    setBusy("delete"); setDeletingId(draftId); setError(null); setSuccess(null);
     try {
-      await apiRequest(`/api/drafts/${currentId}`, { method: "DELETE" });
-      setCurrentId(null); setCurrentStatus("not_sent"); setCurrentConversationId(null); setRefinementAllowed(true); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); setForm({ ...emptyForm, purpose_id: purposes[0]?.id || "" }); setDirty(false);
-      await loadLists(); setSuccess("Draft deleted.");
+      await apiRequest(`/api/drafts/${draftId}`, { method: "DELETE" });
+      setDrafts((previous) => previous.filter((draft) => draft.id !== draftId));
+      if (currentId === draftId) {
+        setCurrentId(null); setCurrentStatus("not_sent"); setCurrentConversationId(null); setRefinementAllowed(true); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction("");
+        setForm({ ...emptyForm, purpose_id: purposes.find((item) => item.is_default)?.id || purposes[0]?.id || "", resume_id: resumes.find((item) => item.is_default)?.id || "" }); setDirty(false);
+      }
+      setSuccess("Draft removed from RecruitFlow. Gmail was not changed.");
     } catch (deleteError) { setError(errorMessage(deleteError)); }
-    finally { setBusy(null); }
+    finally { setBusy(null); setDeletingId(null); }
   }
 
   async function prepareReview() {
@@ -259,13 +264,16 @@ export function ComposeDashboard() {
     <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
       <aside className="card h-fit p-4" aria-label="Saved drafts">
         <div className="flex items-center justify-between gap-3"><h2 className="font-bold text-slate-950">Drafts</h2><button type="button" className="button-secondary min-h-9 px-3 py-1" onClick={newDraft}>New</button></div>
-        <p className="mt-1 text-sm text-slate-500">Saved locally · Not sent</p>
+        <p className="mt-1 text-sm text-slate-500">Saved RecruitFlow drafts</p>
         <div className="mt-4 space-y-2">
           {drafts.length === 0 ? <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">No saved drafts yet.</p> : drafts.map((draft) => (
-            <button type="button" key={draft.id} onClick={() => openDraft(draft)} className={`w-full rounded-lg border p-3 text-left ${currentId === draft.id ? "border-blue-300 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`}>
-              <span className="block truncate text-sm font-semibold text-slate-900">{draft.subject}</span>
-              <span className="mt-1 block truncate text-xs text-slate-500">{draft.recipient_name} · {draft.status === "sent" ? "Sent" : "Not sent"}</span>
-            </button>
+            <div key={draft.id} className={`flex items-stretch rounded-lg border ${currentId === draft.id ? "border-blue-300 bg-blue-50" : "border-slate-200"}`}>
+              <button type="button" onClick={() => openDraft(draft)} disabled={busy !== null} className="min-w-0 flex-1 rounded-l-lg p-3 text-left hover:bg-slate-50 disabled:cursor-not-allowed">
+                <span className="block truncate text-sm font-semibold text-slate-900">{draft.subject}</span>
+                <span className="mt-1 block truncate text-xs text-slate-500">{draft.recipient_name} · {draft.status === "sent" ? "Sent" : "Not sent"}</span>
+              </button>
+              <button type="button" onClick={() => void removeDraft(draft.id)} disabled={busy !== null} className="rounded-r-lg border-l border-slate-200 px-3 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60" aria-label={`Delete draft: ${draft.subject}`}>{deletingId === draft.id ? "Deleting…" : "Delete"}</button>
+            </div>
           ))}
         </div>
       </aside>
@@ -296,7 +304,7 @@ export function ComposeDashboard() {
           <section className="card p-5 sm:p-7" aria-labelledby="draft-editor-heading">
             <div className="mb-5"><h2 id="draft-editor-heading" className="text-lg font-bold">Draft editor</h2><p className="mt-1 text-sm text-slate-500">{currentStatus === "sent" ? "This sent draft is read-only." : currentConversationId ? "Follow-up draft · The recipient and thread subject are locked to the original Gmail conversation." : "Review and save every word before preparing the final send review."}</p></div>
             <div className="space-y-4"><Field label="Subject" id="subject"><input id="subject" className="field" value={form.subject} onChange={(e) => update("subject", e.target.value)} maxLength={200} disabled={draftReadOnly || Boolean(currentConversationId)} required /></Field><Field label="Body" id="body"><textarea id="body" className="field min-h-80 resize-y leading-7" value={form.body} onChange={(e) => update("body", e.target.value)} maxLength={10000} disabled={draftReadOnly} required /></Field></div>
-            <div className="mt-5 flex flex-wrap items-center gap-2"><button type="button" className="button-primary" onClick={() => void save()} disabled={!canSave} aria-describedby="save-draft-status">{busy === "save" ? "Saving…" : "Save draft"}</button><button type="button" className="button-danger" onClick={() => void remove()} disabled={!currentId || busy !== null || draftReadOnly}>{busy === "delete" ? "Deleting…" : "Delete draft"}</button><span id="save-draft-status" role="status" className={`text-sm font-medium ${dirty ? "text-amber-700" : "text-emerald-700"}`}>{currentStatus === "sent" ? "Sent · Read-only" : !refinementAllowed ? "Active or uncertain send · Read-only" : !currentId ? "Generate the email to create a saved draft." : dirty ? saveIsValid ? "Unsaved changes · Not sent" : "Complete the required fields to save · Not sent" : "Saved · Not sent — edit any field to enable Save draft."}</span></div>
+            <div className="mt-5 flex flex-wrap items-center gap-2"><button type="button" className="button-primary" onClick={() => void save()} disabled={!canSave} aria-describedby="save-draft-status">{busy === "save" ? "Saving…" : "Save draft"}</button><button type="button" className="button-danger" onClick={() => currentId && void removeDraft(currentId)} disabled={!currentId || busy !== null}>{busy === "delete" && deletingId === currentId ? "Deleting…" : "Delete draft"}</button><span id="save-draft-status" role="status" className={`text-sm font-medium ${dirty ? "text-amber-700" : "text-emerald-700"}`}>{currentStatus === "sent" ? "Sent · Read-only" : !refinementAllowed ? "Active or uncertain send · Read-only" : !currentId ? "Generate the email to create a saved draft." : dirty ? saveIsValid ? "Unsaved changes · Not sent" : "Complete the required fields to save · Not sent" : "Saved · Not sent — edit any field to enable Save draft."}</span></div>
             <div className="mt-6 border-t border-slate-200 pt-6">
               <label htmlFor="refinement-instruction" className="block text-sm font-semibold text-slate-800">Ask AI to refine this email</label>
               <textarea id="refinement-instruction" className="field mt-2 min-h-24 resize-y" value={refinementInstruction} onChange={(event) => setRefinementInstruction(event.target.value)} placeholder="e.g. Make it shorter and rewrite the opening." maxLength={1000} disabled={!currentId || refinementBlocked || busy === "refine"} />

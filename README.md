@@ -15,6 +15,7 @@ RecruitFlow AI is a local-first web application for creating personalized recrui
 - Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
 - Review an immutable server-side snapshot and explicitly approve every individual send. Draft generation, saving, refinement, and review preparation never send email.
 - Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
+- Remove drafts or entire conversations from RecruitFlow locally without deleting or changing messages in Gmail.
 - Keep inbox access, automated outreach, scheduling, and background sending out of scope.
 
 ## Architecture
@@ -63,6 +64,7 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 - **Duplicate-send prevention:** PostgreSQL uniqueness constraints, row locks, and durable `pending -> sending -> sent|failed|uncertain` transitions prevent the same approval from being dispatched twice by concurrent requests.
 - **Conservative delivery state:** Gmail confirmation is required before a send becomes `sent`. An ambiguous timeout or transport failure after dispatch becomes non-retryable `uncertain`; the UI instructs the user to check Gmail Sent mail instead of blindly retrying.
 - **Threaded follow-ups without inbox access:** follow-ups use only RecruitFlow's stored outbound messages. The backend retains Gmail thread IDs and RFC `Message-ID` values, supplies `In-Reply-To` and `References`, and rejects follow-ups when same-thread delivery cannot be safely established.
+- **Durable local deletion:** draft and conversation tombstones hide deleted records from normal APIs while preserving send snapshots, Gmail thread identifiers, and duplicate-send safeguards. Pending reviews become stale, active dispatches cannot be deleted, and no delete operation calls Gmail. Future synchronization must honor the root conversation tombstone.
 
 ## Local setup on Windows
 
@@ -196,7 +198,7 @@ npm.cmd run build
 Set-Location ..
 ```
 
-Latest verified backend result: **106 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
+Latest verified backend result: **111 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
 
 ## Security limitations
 

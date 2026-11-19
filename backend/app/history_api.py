@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -42,15 +42,18 @@ def _timestamp(send: EmailSend) -> datetime:
     return send.sent_at or send.approved_at or send.updated_at or send.created_at
 
 
-def _root(conversation_id: UUID, db: Session) -> EmailSend:
-    root = db.scalar(
-        select(EmailSend).where(
-            EmailSend.id == conversation_id,
-            EmailSend.owner_id == _owner_id(),
-            EmailSend.conversation_id.is_(None),
-            EmailSend.status.in_(("sent", "uncertain")),
-        )
-    )
+def _root(
+    conversation_id: UUID, db: Session, *, include_deleted: bool = False
+) -> EmailSend:
+    conditions = [
+        EmailSend.id == conversation_id,
+        EmailSend.owner_id == _owner_id(),
+        EmailSend.conversation_id.is_(None),
+        EmailSend.status.in_(("sent", "uncertain")),
+    ]
+    if not include_deleted:
+        conditions.append(EmailSend.deleted_at.is_(None))
+    root = db.scalar(select(EmailSend).where(*conditions))
     if root is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
     return root
@@ -64,6 +67,7 @@ def _followups(root: EmailSend, db: Session) -> list[EmailSend]:
                 EmailSend.owner_id == _owner_id(),
                 EmailSend.conversation_id == root.id,
                 EmailSend.status.in_(("sent", "uncertain")),
+                EmailSend.deleted_at.is_(None),
             )
             .order_by(func.coalesce(EmailSend.sent_at, EmailSend.updated_at).asc())
         )
@@ -81,7 +85,8 @@ def _can_follow_up(
         )
     )
     return bool(
-        root.status == "sent"
+        root.deleted_at is None
+        and root.status == "sent"
         and root.gmail_thread_id
         and root.rfc_message_id
         and connection
@@ -105,6 +110,7 @@ def list_history(
             EmailSend.owner_id == _owner_id(),
             EmailSend.conversation_id.is_(None),
             EmailSend.status.in_(("sent", "uncertain")),
+            EmailSend.deleted_at.is_(None),
         )
     )
     if search and search.strip():
@@ -187,6 +193,55 @@ def conversation_detail(
     )
 
 
+@router.delete("/api/history/{conversation_id}", status_code=204)
+def delete_conversation(
+    conversation_id: UUID, db: Annotated[Session, Depends(get_db)]
+) -> Response:
+    candidate = _root(conversation_id, db, include_deleted=True)
+    drafts = list(
+        db.scalars(
+            select(EmailDraft)
+            .where(
+                EmailDraft.owner_id == _owner_id(),
+                or_(
+                    EmailDraft.id == candidate.draft_id,
+                    EmailDraft.conversation_id == candidate.id,
+                ),
+            )
+            .with_for_update()
+        )
+    )
+    sends = list(
+        db.scalars(
+            select(EmailSend)
+            .where(
+                EmailSend.owner_id == _owner_id(),
+                or_(EmailSend.id == candidate.id, EmailSend.conversation_id == candidate.id),
+            )
+            .with_for_update()
+        )
+    )
+    root = next((send for send in sends if send.id == candidate.id), None)
+    if root is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if root.deleted_at is not None:
+        return Response(status_code=204)
+    if any(send.status == "sending" for send in sends):
+        raise HTTPException(
+            status_code=409,
+            detail="This conversation cannot be deleted while Gmail delivery is in progress.",
+        )
+    deleted_at = datetime.now(timezone.utc)
+    for draft in drafts:
+        draft.deleted_at = deleted_at
+    for send in sends:
+        if send.status == "pending":
+            send.status = "stale"
+        send.deleted_at = deleted_at
+    _commit(db)
+    return Response(status_code=204)
+
+
 @router.post("/api/followups/generate", response_model=EmailDraftResponse)
 async def generate_followup(
     payload: FollowupGenerationRequest,
@@ -264,6 +319,7 @@ async def generate_followup(
     except AIMalformedResponseError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    root = _root(payload.conversation_id, db)
     draft = EmailDraft(
         owner_id=_owner_id(),
         purpose_id=purpose.id,

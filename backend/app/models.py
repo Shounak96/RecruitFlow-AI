@@ -110,6 +110,7 @@ class EmailDraft(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def status(self) -> str:
@@ -214,6 +215,7 @@ class EmailSend(Base):
     in_reply_to: Mapped[str | None] = mapped_column(String(320), nullable=True)
     references_header: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
