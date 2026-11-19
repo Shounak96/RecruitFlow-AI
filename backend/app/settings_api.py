@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -11,12 +12,36 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database import get_db
-from app.models import EmailPurpose, GmailConnection, Resume, SenderProfile
+from app.automatic_sending import (
+    AutomaticSendingError,
+    automatic_send_allowance,
+    authorize_automatic_draft,
+    ensure_sending_preference,
+    load_automatic_attachment,
+    revoke_owner_authorizations,
+)
+from app.models import (
+    AutomaticSendAuthorization,
+    AutomaticSendClaim,
+    EmailDraft,
+    EmailSend,
+    EmailPurpose,
+    GmailConnection,
+    Resume,
+    SenderProfile,
+    SendingPreference,
+)
 from app.schemas import (
+    AutomaticSendAuthorizationCreate,
+    AutomaticSendAuthorizationResponse,
+    AutomaticSendAttachmentResponse,
+    AutomaticSendPreviewResponse,
     EmailPurposeCreate,
     EmailPurposeResponse,
     EmailPurposeUpdate,
     ResumeResponse,
+    SendingPreferenceResponse,
+    SendingPreferenceUpdate,
     SenderProfileResponse,
     SenderProfileUpdate,
 )
@@ -100,6 +125,232 @@ def update_profile(
     profile.name = payload.name
     _commit(db)
     return _profile_response(profile, db)
+
+
+@router.get("/sending-preferences", response_model=SendingPreferenceResponse)
+def get_sending_preferences(
+    db: Annotated[Session, Depends(get_db)],
+) -> SendingPreference:
+    preference = ensure_sending_preference(db, _owner_id())
+    _commit(db)
+    db.refresh(preference)
+    return preference
+
+
+@router.put("/sending-preferences", response_model=SendingPreferenceResponse)
+def update_sending_preferences(
+    payload: SendingPreferenceUpdate,
+    db: Annotated[Session, Depends(get_db)],
+) -> SendingPreference:
+    owner_id = _owner_id()
+    ensure_sending_preference(db, owner_id)
+    preference = db.scalar(
+        select(SendingPreference)
+        .where(SendingPreference.owner_id == owner_id)
+        .with_for_update()
+    )
+    if preference is None:
+        raise HTTPException(status_code=409, detail="Sending preferences are unavailable.")
+    now = datetime.now(timezone.utc)
+    if payload.sending_mode == "automatic":
+        if preference.sending_mode != "automatic" and not payload.confirm_automatic_sending:
+            raise HTTPException(
+                status_code=422,
+                detail="Confirm automatic sending before enabling it.",
+            )
+        if preference.sending_mode != "automatic":
+            preference.automation_consented_at = now
+        preference.automation_disabled_at = None
+    else:
+        preference.automation_disabled_at = now
+        revoke_owner_authorizations(db, owner_id, reason="automation_disabled", now=now)
+    if not payload.automatic_initial_outreach:
+        db.execute(
+            update(AutomaticSendAuthorization)
+            .where(
+                AutomaticSendAuthorization.owner_id == owner_id,
+                AutomaticSendAuthorization.authorization_kind == "initial",
+                AutomaticSendAuthorization.revoked_at.is_(None),
+            )
+            .values(revoked_at=now, revocation_reason="category_disabled")
+        )
+    if not payload.automatic_followups:
+        db.execute(
+            update(AutomaticSendAuthorization)
+            .where(
+                AutomaticSendAuthorization.owner_id == owner_id,
+                AutomaticSendAuthorization.authorization_kind == "follow_up",
+                AutomaticSendAuthorization.revoked_at.is_(None),
+            )
+            .values(revoked_at=now, revocation_reason="category_disabled")
+        )
+    preference.sending_mode = payload.sending_mode
+    preference.automatic_initial_outreach = payload.automatic_initial_outreach
+    preference.automatic_followups = payload.automatic_followups
+    preference.daily_send_limit = payload.daily_send_limit
+    _commit(db)
+    db.refresh(preference)
+    return preference
+
+
+@router.post("/sending-preferences/disable", response_model=SendingPreferenceResponse)
+def disable_automatic_sending(
+    db: Annotated[Session, Depends(get_db)],
+) -> SendingPreference:
+    owner_id = _owner_id()
+    preference = ensure_sending_preference(db, owner_id)
+    now = datetime.now(timezone.utc)
+    preference.sending_mode = "manual"
+    preference.automatic_initial_outreach = False
+    preference.automatic_followups = False
+    preference.automation_disabled_at = now
+    revoke_owner_authorizations(db, owner_id, reason="automation_disabled", now=now)
+    _commit(db)
+    db.refresh(preference)
+    return preference
+
+
+@router.get(
+    "/automatic-authorizations",
+    response_model=list[AutomaticSendAuthorizationResponse],
+)
+def list_automatic_authorizations(
+    db: Annotated[Session, Depends(get_db)],
+) -> list[AutomaticSendAuthorization]:
+    return list(
+        db.scalars(
+            select(AutomaticSendAuthorization)
+            .where(AutomaticSendAuthorization.owner_id == _owner_id())
+            .order_by(AutomaticSendAuthorization.authorized_at.desc())
+        )
+    )
+
+
+@router.get(
+    "/automatic-authorizations/preview/{draft_id}",
+    response_model=AutomaticSendPreviewResponse,
+)
+def preview_automatic_authorization(
+    draft_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+) -> AutomaticSendPreviewResponse:
+    owner_id = _owner_id()
+    preference = ensure_sending_preference(db, owner_id)
+    draft = db.scalar(
+        select(EmailDraft).where(
+            EmailDraft.id == draft_id,
+            EmailDraft.owner_id == owner_id,
+            EmailDraft.deleted_at.is_(None),
+        )
+    )
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Draft not found.")
+    if draft.sent_at is not None:
+        raise HTTPException(status_code=409, detail="This draft has already been sent.")
+    if draft.reply_to_received_message_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Replies to received messages require manual review and approval.",
+        )
+    kind = "follow_up" if draft.conversation_id is not None else "initial"
+    if (
+        preference.sending_mode != "automatic"
+        or preference.automation_consented_at is None
+        or (kind == "initial" and not preference.automatic_initial_outreach)
+        or (kind == "follow_up" and not preference.automatic_followups)
+    ):
+        raise HTTPException(status_code=409, detail="Automatic sending is not enabled for this draft type.")
+    connection = db.scalar(
+        select(GmailConnection).where(
+            GmailConnection.owner_id == owner_id,
+            GmailConnection.is_valid.is_(True),
+        )
+    )
+    if connection is None:
+        raise HTTPException(status_code=409, detail="A verified Gmail connection is required.")
+    try:
+        attachment = load_automatic_attachment(db, owner_id, draft)
+    except AutomaticSendingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    authorization = db.scalar(
+        select(AutomaticSendAuthorization).where(
+            AutomaticSendAuthorization.owner_id == owner_id,
+            AutomaticSendAuthorization.draft_id == draft.id,
+            AutomaticSendAuthorization.revoked_at.is_(None),
+        )
+    )
+    status_value = "authorized" if authorization else "eligible"
+    if authorization is not None:
+        claim = db.scalar(
+            select(AutomaticSendClaim).where(
+                AutomaticSendClaim.authorization_id == authorization.id
+            )
+        )
+        if claim is not None and claim.status in {"sent", "uncertain"}:
+            status_value = claim.status
+    remaining, daily_limit = automatic_send_allowance(db, owner_id)
+    return AutomaticSendPreviewResponse(
+        draft_id=draft.id,
+        authorization_id=authorization.id if authorization else None,
+        authorization_status=status_value,
+        sender_email=connection.email,
+        recipient_email=draft.recipient_email,
+        subject=draft.subject,
+        body=draft.body,
+        attachment=(
+            AutomaticSendAttachmentResponse(
+                filename=attachment.filename, size_bytes=attachment.size_bytes
+            )
+            if attachment
+            else None
+        ),
+        remaining_today=remaining,
+        daily_limit=daily_limit,
+    )
+
+
+@router.post(
+    "/automatic-authorizations",
+    response_model=AutomaticSendAuthorizationResponse,
+    status_code=201,
+)
+def create_automatic_authorization(
+    payload: AutomaticSendAuthorizationCreate,
+    db: Annotated[Session, Depends(get_db)],
+) -> AutomaticSendAuthorization:
+    _ = payload.approved
+    try:
+        authorization = authorize_automatic_draft(
+            db, _owner_id(), payload.draft_id, payload.recipient_email
+        )
+        _commit(db)
+    except AutomaticSendingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.refresh(authorization)
+    return authorization
+
+
+@router.delete("/automatic-authorizations/{authorization_id}", status_code=204)
+def revoke_automatic_authorization(
+    authorization_id: UUID,
+    db: Annotated[Session, Depends(get_db)],
+) -> Response:
+    authorization = db.scalar(
+        select(AutomaticSendAuthorization)
+        .where(
+            AutomaticSendAuthorization.id == authorization_id,
+            AutomaticSendAuthorization.owner_id == _owner_id(),
+        )
+        .with_for_update()
+    )
+    if authorization is None:
+        raise HTTPException(status_code=404, detail="Authorization not found.")
+    if authorization.revoked_at is None:
+        authorization.revoked_at = datetime.now(timezone.utc)
+        authorization.revocation_reason = "user_revoked"
+        _commit(db)
+    return Response(status_code=204)
 
 
 @router.get("/resumes", response_model=list[ResumeResponse])

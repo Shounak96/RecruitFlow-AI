@@ -61,7 +61,8 @@ def isolated_app(test_engine, tmp_path) -> Generator[None, None, None]:
     with test_engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE received_gmail_messages, email_sends, gmail_oauth_states, gmail_connections, "
+                "TRUNCATE automatic_send_requests, automatic_send_claims, automatic_send_authorizations, sending_preferences, "
+                "received_gmail_messages, email_sends, gmail_oauth_states, gmail_connections, "
                 "email_drafts, email_purposes, resumes, sender_profiles "
                 "RESTART IDENTITY CASCADE"
             )

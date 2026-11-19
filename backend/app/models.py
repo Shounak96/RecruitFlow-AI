@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -287,5 +288,161 @@ class ReceivedGmailMessage(Base):
     seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class SendingPreference(Base):
+    __tablename__ = "sending_preferences"
+    __table_args__ = (
+        CheckConstraint(
+            "sending_mode IN ('manual', 'automatic')",
+            name="ck_sending_preferences_mode",
+        ),
+        CheckConstraint(
+            "daily_send_limit >= 1 AND daily_send_limit <= 500",
+            name="ck_sending_preferences_daily_limit",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(unique=True)
+    sending_mode: Mapped[str] = mapped_column(
+        String(20), default="manual", server_default="manual"
+    )
+    automatic_initial_outreach: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    automatic_followups: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    daily_send_limit: Mapped[int] = mapped_column(default=5, server_default="5")
+    automation_consented_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    automation_disabled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AutomaticSendAuthorization(Base):
+    __tablename__ = "automatic_send_authorizations"
+    __table_args__ = (
+        CheckConstraint(
+            "authorization_kind IN ('initial', 'follow_up')",
+            name="ck_automatic_send_authorizations_kind",
+        ),
+        Index(
+            "uq_automatic_send_authorizations_active_draft",
+            "draft_id",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    draft_id: Mapped[UUID] = mapped_column(
+        ForeignKey("email_drafts.id", ondelete="RESTRICT"), index=True
+    )
+    authorization_kind: Mapped[str] = mapped_column(String(20))
+    recipient_email: Mapped[str] = mapped_column(String(320))
+    sender_email: Mapped[str] = mapped_column(String(320))
+    gmail_subject: Mapped[str] = mapped_column(String(255))
+    draft_fingerprint: Mapped[str] = mapped_column(String(64))
+    attachment_resume_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("resumes.id", ondelete="RESTRICT"), nullable=True
+    )
+    attachment_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attachment_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attachment_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authorized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    revocation_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AutomaticSendClaim(Base):
+    __tablename__ = "automatic_send_claims"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('claimed', 'sent', 'uncertain', 'released')",
+            name="ck_automatic_send_claims_status",
+        ),
+        UniqueConstraint(
+            "authorization_id", name="uq_automatic_send_claims_authorization"
+        ),
+        Index("ix_automatic_send_claims_owner_day", "owner_id", "claim_date"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    authorization_id: Mapped[UUID] = mapped_column(
+        ForeignKey("automatic_send_authorizations.id", ondelete="RESTRICT")
+    )
+    draft_id: Mapped[UUID] = mapped_column(
+        ForeignKey("email_drafts.id", ondelete="RESTRICT"), index=True
+    )
+    claim_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(
+        String(20), default="claimed", server_default="claimed"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AutomaticSendRequest(Base):
+    __tablename__ = "automatic_send_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('generating', 'dispatching', 'sent', 'uncertain', 'failed')",
+            name="ck_automatic_send_requests_status",
+        ),
+        UniqueConstraint(
+            "owner_id", "idempotency_key", name="uq_automatic_send_requests_owner_key"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    idempotency_key: Mapped[UUID]
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(20), default="generating", server_default="generating"
+    )
+    draft_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("email_drafts.id", ondelete="RESTRICT"), nullable=True
+    )
+    authorization_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("automatic_send_authorizations.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    send_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("email_sends.id", ondelete="RESTRICT"), nullable=True
+    )
+    failure_category: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 

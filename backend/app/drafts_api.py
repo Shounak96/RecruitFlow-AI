@@ -1,9 +1,12 @@
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai_provider import (
@@ -15,10 +18,18 @@ from app.ai_provider import (
     EmailGenerationContext,
     get_ai_provider,
 )
+from app.automatic_sending import (
+    AutomaticSendingError,
+    authorize_automatic_draft,
+    revoke_draft_authorizations,
+    validate_automatic_initial_preflight,
+)
 from app.database import get_db
-from app.gmail_api import _received_fingerprint
+from app.gmail_api import _received_fingerprint, run_authorized_send
+from app.gmail_service import GmailService, get_gmail_service
 from app.gmail_replies import clean_received_body
 from app.models import (
+    AutomaticSendRequest,
     EmailDraft,
     EmailPurpose,
     EmailSend,
@@ -28,6 +39,9 @@ from app.models import (
 )
 from app.resume_text import ResumeExtractionError, extract_resume_text
 from app.schemas import (
+    AutomaticEmailGenerationRequest,
+    AutomaticEmailSendResult,
+    AutomaticSendDispatch,
     EmailDraftResponse,
     EmailDraftUpdate,
     EmailGenerationRequest,
@@ -260,6 +274,56 @@ def _generation_context(
     )
 
 
+def _automatic_request_fingerprint(payload: AutomaticEmailGenerationRequest) -> str:
+    canonical = json.dumps(
+        payload.model_dump(mode="json", exclude={"idempotency_key"}),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _stored_automatic_result(
+    request_row: AutomaticSendRequest, db: Session
+) -> AutomaticEmailSendResult | None:
+    send = db.get(EmailSend, request_row.send_id) if request_row.send_id else None
+    if send is None and request_row.draft_id is not None:
+        send = db.scalar(
+            select(EmailSend)
+            .where(
+                EmailSend.owner_id == request_row.owner_id,
+                EmailSend.draft_id == request_row.draft_id,
+            )
+            .order_by(EmailSend.created_at.desc())
+        )
+    if send is None or send.status not in {"sent", "uncertain"}:
+        return None
+    request_row.send_id = send.id
+    request_row.status = send.status
+    _commit(db)
+    return AutomaticEmailSendResult(
+        id=send.id,
+        draft_id=send.draft_id,
+        status=send.status,
+        gmail_message_id=send.gmail_message_id,
+        gmail_thread_id=send.gmail_thread_id,
+        sent_at=send.sent_at,
+        idempotency_key=request_row.idempotency_key,
+    )
+
+
+def _fail_automatic_request(
+    db: Session, request_id: UUID, *, category: str
+) -> None:
+    db.rollback()
+    request_row = db.get(AutomaticSendRequest, request_id)
+    if request_row is not None and request_row.status not in {"sent", "uncertain"}:
+        request_row.status = "failed"
+        request_row.failure_category = category[:80]
+        _commit(db)
+
+
 @router.post("/generate", response_model=EmailDraftResponse)
 async def generate_draft(
     payload: EmailGenerationRequest,
@@ -323,6 +387,200 @@ async def generate_draft(
     _commit(db)
     db.refresh(draft)
     return _draft_response(draft, db)
+
+
+@router.post("/generate-and-send", response_model=AutomaticEmailSendResult)
+async def generate_and_send_automatically(
+    payload: AutomaticEmailGenerationRequest,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
+    provider: Annotated[AIEmailProvider, Depends(get_ai_provider)],
+    gmail_service: Annotated[GmailService, Depends(get_gmail_service)],
+) -> AutomaticEmailSendResult:
+    owner_id = _owner_id()
+    fingerprint = _automatic_request_fingerprint(payload)
+    existing = db.scalar(
+        select(AutomaticSendRequest).where(
+            AutomaticSendRequest.owner_id == owner_id,
+            AutomaticSendRequest.idempotency_key == payload.idempotency_key,
+        )
+    )
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="This idempotency key was already used for different email details.",
+            )
+        stored = _stored_automatic_result(existing, db)
+        if stored is not None:
+            if stored.status == "uncertain":
+                response.status_code = 202
+            return stored
+        if existing.status == "failed":
+            raise HTTPException(
+                status_code=409,
+                detail="This one-click request already failed. Review the error before starting a new request.",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="This one-click request is already in progress. Do not submit it again.",
+        )
+
+    try:
+        connection = validate_automatic_initial_preflight(db, owner_id)
+    except AutomaticSendingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    purpose = _owned_purpose(payload.purpose_id, db)
+    resume = _owned_resume(payload.resume_id, db)
+    profile = db.scalar(
+        select(SenderProfile).where(SenderProfile.owner_id == owner_id)
+    )
+    if profile is None or not profile.name.strip():
+        raise HTTPException(status_code=422, detail="Set a sender name in Settings first.")
+
+    purpose_snapshot = (purpose.title, purpose.description, purpose.updated_at)
+    profile_name = profile.name
+    gmail_identity = (connection.email.lower(), connection.google_subject)
+    resume_text = None
+    resume_checksum = None
+    if resume is not None:
+        path = _storage_path(resume.storage_key)
+        if not path.is_file():
+            raise HTTPException(status_code=422, detail="The selected resume file is unavailable.")
+        try:
+            resume_bytes = path.read_bytes()
+            resume_checksum = hashlib.sha256(resume_bytes).hexdigest()
+            resume_text = extract_resume_text(path)
+        except OSError as exc:
+            raise HTTPException(status_code=422, detail="The selected resume file is unavailable.") from exc
+        except ResumeExtractionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    context = _generation_context(
+        payload=payload,
+        profile=profile,
+        purpose=purpose,
+        resume_text=resume_text,
+    )
+    request_row = AutomaticSendRequest(
+        owner_id=owner_id,
+        idempotency_key=payload.idempotency_key,
+        request_fingerprint=fingerprint,
+        status="generating",
+    )
+    db.add(request_row)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="This one-click request is already in progress. Do not submit it again.",
+        ) from exc
+    db.refresh(request_row)
+    request_id = request_row.id
+
+    try:
+        generated = await provider.generate_email(context)
+    except AIRateLimitError as exc:
+        _fail_automatic_request(db, request_id, category="ai_rate_limit")
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except AITimeoutError as exc:
+        _fail_automatic_request(db, request_id, category="ai_timeout")
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except AIUnavailableError as exc:
+        _fail_automatic_request(db, request_id, category="ai_unavailable")
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except AIMalformedResponseError as exc:
+        _fail_automatic_request(db, request_id, category="ai_malformed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    db.expire_all()
+    live_purpose = db.scalar(
+        select(EmailPurpose).where(
+            EmailPurpose.id == payload.purpose_id,
+            EmailPurpose.owner_id == owner_id,
+        )
+    )
+    live_profile = db.scalar(
+        select(SenderProfile).where(SenderProfile.owner_id == owner_id)
+    )
+    if live_purpose is None or (
+        live_purpose.title,
+        live_purpose.description,
+        live_purpose.updated_at,
+    ) != purpose_snapshot:
+        _fail_automatic_request(db, request_id, category="purpose_changed")
+        raise HTTPException(status_code=409, detail="The selected email purpose changed during generation.")
+    if live_profile is None or live_profile.name != profile_name:
+        _fail_automatic_request(db, request_id, category="sender_profile_changed")
+        raise HTTPException(status_code=409, detail="The sender profile changed during generation.")
+    if resume is not None:
+        live_resume = db.scalar(
+            select(Resume).where(
+                Resume.id == payload.resume_id,
+                Resume.owner_id == owner_id,
+            )
+        )
+        if live_resume is None:
+            _fail_automatic_request(db, request_id, category="resume_unavailable")
+            raise HTTPException(status_code=409, detail="The selected resume became unavailable.")
+        try:
+            path = _storage_path(live_resume.storage_key)
+            current_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, HTTPException) as exc:
+            _fail_automatic_request(db, request_id, category="resume_unavailable")
+            raise HTTPException(status_code=409, detail="The selected resume became unavailable.") from exc
+        if current_checksum != resume_checksum:
+            _fail_automatic_request(db, request_id, category="resume_changed")
+            raise HTTPException(status_code=409, detail="The selected resume changed during generation.")
+    try:
+        live_connection = validate_automatic_initial_preflight(db, owner_id)
+    except AutomaticSendingError as exc:
+        _fail_automatic_request(db, request_id, category="automatic_precondition")
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if (live_connection.email.lower(), live_connection.google_subject) != gmail_identity:
+        _fail_automatic_request(db, request_id, category="gmail_identity_changed")
+        raise HTTPException(status_code=409, detail="The Gmail sender identity changed during generation.")
+
+    draft = EmailDraft(owner_id=owner_id, subject=generated.subject, body=generated.body)
+    db.add(draft)
+    _apply_context(draft, payload)
+    try:
+        db.flush()
+        authorization = authorize_automatic_draft(
+            db, owner_id, draft.id, payload.recipient_email
+        )
+        request_row = db.get(AutomaticSendRequest, request_id)
+        request_row.draft_id = draft.id
+        request_row.authorization_id = authorization.id
+        request_row.status = "dispatching"
+        _commit(db)
+    except AutomaticSendingError as exc:
+        _fail_automatic_request(db, request_id, category="authorization_failed")
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        _fail_automatic_request(db, request_id, category="authorization_persist_failed")
+        raise
+
+    try:
+        result = await run_authorized_send(
+            authorization.id,
+            AutomaticSendDispatch(run_authorized_send=True),
+            response,
+            db,
+            gmail_service,
+        )
+    except HTTPException as exc:
+        _fail_automatic_request(db, request_id, category=f"dispatch_http_{exc.status_code}")
+        raise
+    request_row = db.get(AutomaticSendRequest, request_id)
+    request_row.send_id = result.id
+    request_row.status = result.status
+    _commit(db)
+    return AutomaticEmailSendResult(
+        **result.model_dump(), idempotency_key=payload.idempotency_key
+    )
 
 
 @router.post("/{draft_id}/refine", response_model=EmailRevisionResponse)
@@ -471,6 +729,9 @@ def update_draft(
     _ensure_unsent(draft, db)
     _validate_followup_payload(draft, payload, db)
     _invalidate_pending_reviews(draft.id, db)
+    revoke_draft_authorizations(
+        db, _owner_id(), draft.id, reason="draft_changed"
+    )
     _apply_context(draft, payload)
     draft.subject = payload.subject
     draft.body = payload.body
@@ -502,7 +763,9 @@ def delete_draft(draft_id: UUID, db: Annotated[Session, Depends(get_db)]) -> Res
     for send in sends:
         if send.status == "pending":
             send.status = "stale"
+    revoke_draft_authorizations(
+        db, _owner_id(), draft.id, reason="draft_deleted"
+    )
     draft.deleted_at = datetime.now(timezone.utc)
     _commit(db)
     return Response(status_code=204)
-

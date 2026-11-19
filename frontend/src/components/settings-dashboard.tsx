@@ -6,6 +6,8 @@ import { apiRequest, apiUrl } from "@/lib/api";
 
 type Profile = { name: string; gmail_connected: boolean; gmail_email: string | null };
 type GmailAuthorization = { authorization_url: string };
+type SendingPreferences = { sending_mode: "manual" | "automatic"; automatic_initial_outreach: boolean; automatic_followups: boolean; daily_send_limit: number; automation_consented_at: string | null; automation_disabled_at: string | null; stage_a_dispatch_enabled: false };
+type AutomaticAuthorization = { id: string; draft_id: string; authorization_kind: "initial" | "follow_up"; recipient_email: string; sender_email: string; authorized_at: string; revoked_at: string | null; revocation_reason: string | null };
 type Resume = {
   id: string;
   display_name: string;
@@ -36,6 +38,8 @@ export function SettingsDashboard() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [resumes, setResumes] = useState<Resume[]>([]);
   const [purposes, setPurposes] = useState<Purpose[]>([]);
+  const [sendingPreferences, setSendingPreferences] = useState<SendingPreferences | null>(null);
+  const [automaticAuthorizations, setAutomaticAuthorizations] = useState<AutomaticAuthorization[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,20 +50,34 @@ export function SettingsDashboard() {
   const [purposeTitle, setPurposeTitle] = useState("");
   const [purposeDescription, setPurposeDescription] = useState("");
   const [editingPurpose, setEditingPurpose] = useState<string | null>(null);
+  const [sendingMode, setSendingMode] = useState<"manual" | "automatic">("manual");
+  const [automaticInitialOutreach, setAutomaticInitialOutreach] = useState(false);
+  const [automaticFollowups, setAutomaticFollowups] = useState(false);
+  const [dailySendLimit, setDailySendLimit] = useState("5");
+  const [automationConsent, setAutomationConsent] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
     setError(null);
     try {
-      const [profileData, resumeData, purposeData] = await Promise.all([
+      const [profileData, resumeData, purposeData, preferenceData, authorizationData] = await Promise.all([
         apiRequest<Profile>("/api/settings/profile"),
         apiRequest<Resume[]>("/api/settings/resumes"),
         apiRequest<Purpose[]>("/api/settings/purposes"),
+        apiRequest<SendingPreferences>("/api/settings/sending-preferences"),
+        apiRequest<AutomaticAuthorization[]>("/api/settings/automatic-authorizations"),
       ]);
       setProfile(profileData);
       setSenderName(profileData.name);
       setResumes(resumeData);
       setPurposes(purposeData);
+      setSendingPreferences(preferenceData);
+      setAutomaticAuthorizations(authorizationData);
+      setSendingMode(preferenceData.sending_mode);
+      setAutomaticInitialOutreach(preferenceData.automatic_initial_outreach);
+      setAutomaticFollowups(preferenceData.automatic_followups);
+      setDailySendLimit(String(preferenceData.daily_send_limit));
+      setAutomationConsent(false);
     } catch (loadError) {
       setError(messageFrom(loadError));
     } finally {
@@ -127,6 +145,56 @@ export function SettingsDashboard() {
       await load();
       notify("Gmail disconnected.");
     } catch (disconnectError) { setError(messageFrom(disconnectError)); }
+    finally { setBusy(null); }
+  }
+
+  async function saveSendingPreferences(event: FormEvent) {
+    event.preventDefault();
+    const parsedDailySendLimit = Number(dailySendLimit);
+    if (!Number.isInteger(parsedDailySendLimit) || parsedDailySendLimit < 1 || parsedDailySendLimit > 500) {
+      setError("Maximum automatic sends must be a whole number from 1 to 500.");
+      setSuccess(null);
+      return;
+    }
+    setBusy("sending-preferences"); setError(null); setSuccess(null);
+    try {
+      const saved = await apiRequest<SendingPreferences>("/api/settings/sending-preferences", {
+        method: "PUT",
+        body: JSON.stringify({
+          sending_mode: sendingMode,
+          automatic_initial_outreach: sendingMode === "automatic" && automaticInitialOutreach,
+          automatic_followups: sendingMode === "automatic" && automaticFollowups,
+          daily_send_limit: parsedDailySendLimit,
+          confirm_automatic_sending: sendingMode === "automatic" && (sendingPreferences?.sending_mode === "automatic" || automationConsent),
+        }),
+      });
+      setSendingPreferences(saved); setDailySendLimit(String(saved.daily_send_limit)); setAutomationConsent(false);
+      setAutomaticAuthorizations(await apiRequest<AutomaticAuthorization[]>("/api/settings/automatic-authorizations"));
+      notify(saved.sending_mode === "automatic" ? "Automatic sending preferences saved. Generate & Send will send AI-generated initial outreach immediately after its explicit click." : "Manual approval mode saved.");
+    } catch (saveError) { setError(messageFrom(saveError)); }
+    finally { setBusy(null); }
+  }
+
+  async function disableAutomation() {
+    if (!window.confirm("Disable automatic sending preferences and revoke all active draft authorizations? Manual sending will remain available.")) return;
+    setBusy("disable-automation"); setError(null); setSuccess(null);
+    try {
+      const saved = await apiRequest<SendingPreferences>("/api/settings/sending-preferences/disable", { method: "POST" });
+      setSendingPreferences(saved); setSendingMode("manual"); setAutomaticInitialOutreach(false); setAutomaticFollowups(false); setAutomationConsent(false);
+      setAutomaticAuthorizations(await apiRequest<AutomaticAuthorization[]>("/api/settings/automatic-authorizations"));
+      notify("Automation disabled and active draft authorizations revoked. Manual approval remains required.");
+    } catch (actionError) { setError(messageFrom(actionError)); }
+    finally { setBusy(null); }
+  }
+
+  async function revokeAuthorization(id: string) {
+    if (!window.confirm("Revoke this draft-specific automatic-send authorization?")) return;
+    setBusy(`authorization-${id}`); setError(null); setSuccess(null);
+    try {
+      await apiRequest(`/api/settings/automatic-authorizations/${id}`, { method: "DELETE" });
+      setAutomaticAuthorizations(await apiRequest<AutomaticAuthorization[]>("/api/settings/automatic-authorizations"));
+      notify("Draft authorization revoked.");
+    } catch (actionError) { setError(messageFrom(actionError)); }
     finally { setBusy(null); }
   }
 
@@ -274,6 +342,41 @@ export function SettingsDashboard() {
           ) : (
             <button type="button" className="button-primary shrink-0" disabled={busy === "gmail"} onClick={() => void connectGmail()}>{busy === "gmail" ? "Connecting…" : "Connect Gmail"}</button>
           )}
+        </div>
+      </section>
+
+      <section className="card p-5 sm:p-7" aria-labelledby="sending-preferences-heading">
+        <div className="mb-6">
+          <h2 id="sending-preferences-heading" className="text-lg font-bold text-slate-950">Email Sending Preferences</h2>
+          <p className="mt-1 text-sm leading-6 text-slate-500">Manual approval remains the default. In automatic mode, clicking Generate & Send explicitly authorizes one generated initial-outreach email and sends it without preview. Nothing runs in the background.</p>
+        </div>
+        <form onSubmit={saveSendingPreferences} className="space-y-5">
+          <fieldset>
+            <legend className="text-sm font-semibold text-slate-800">Sending mode</legend>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <label className={`rounded-xl border p-4 ${sendingMode === "manual" ? "border-blue-300 bg-blue-50" : "border-slate-200"}`}><span className="flex items-start gap-3"><input type="radio" name="sending-mode" value="manual" checked={sendingMode === "manual"} onChange={() => { setSendingMode("manual"); setAutomaticInitialOutreach(false); setAutomaticFollowups(false); setAutomationConsent(false); }} /><span><span className="block font-semibold text-slate-900">Manual Approval</span><span className="mt-1 block text-sm text-slate-600">Default. Every email requires the existing final review and explicit approval.</span></span></span></label>
+              <label className={`rounded-xl border p-4 ${sendingMode === "automatic" ? "border-blue-300 bg-blue-50" : "border-slate-200"}`}><span className="flex items-start gap-3"><input type="radio" name="sending-mode" value="automatic" checked={sendingMode === "automatic"} onChange={() => setSendingMode("automatic")} /><span><span className="block font-semibold text-slate-900">Automatic Sending</span><span className="mt-1 block text-sm text-slate-600">One explicit Generate & Send click generates and immediately sends initial outreach without preview. No background sending.</span></span></span></label>
+            </div>
+          </fieldset>
+          <fieldset disabled={sendingMode !== "automatic"} className="rounded-xl border border-slate-200 bg-slate-50 p-4 disabled:opacity-60">
+            <legend className="px-1 text-sm font-semibold text-slate-800">Eligible automatic categories</legend>
+            <div className="space-y-3">
+              <label className="flex items-center gap-3 text-sm text-slate-800"><input type="checkbox" checked={automaticInitialOutreach} onChange={(event) => setAutomaticInitialOutreach(event.target.checked)} />Automatic initial outreach</label>
+              <label className="flex items-center gap-3 text-sm text-slate-800"><input type="checkbox" checked={automaticFollowups} onChange={(event) => setAutomaticFollowups(event.target.checked)} />Automatic follow-ups (advanced authorization flow; not one-click)</label>
+              <div className="max-w-xs">
+                <label htmlFor="daily-send-limit" className="mb-2 block text-sm font-semibold text-slate-700">Maximum automatic sends per UTC day</label>
+                <input id="daily-send-limit" className="field" type="number" min="1" max="500" step="1" inputMode="numeric" required value={dailySendLimit} onChange={(event) => setDailySendLimit(event.target.value)} aria-describedby="daily-send-limit-help" />
+                <p id="daily-send-limit-help" className="mt-2 text-xs text-slate-500">Enter a whole number from 1 to 500. This is a maximum, not a guarantee of Gmail or AI-provider deliverability.</p>
+              </div>
+            </div>
+          </fieldset>
+          {sendingMode === "automatic" && sendingPreferences?.sending_mode !== "automatic" && <label className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950"><input type="checkbox" checked={automationConsent} onChange={(event) => setAutomationConsent(event.target.checked)} /><span>I explicitly opt in. Enabling this setting alone sends nothing, but each Generate & Send click will send the AI-generated email without preview or another approval.</span></label>}
+          <div className="flex flex-wrap gap-2"><button className="button-primary" disabled={busy !== null || (sendingMode === "automatic" && (!automaticInitialOutreach && !automaticFollowups)) || (sendingMode === "automatic" && sendingPreferences?.sending_mode !== "automatic" && !automationConsent)}>{busy === "sending-preferences" ? "Saving…" : "Save sending preferences"}</button>{sendingPreferences?.sending_mode === "automatic" && <button type="button" className="button-danger" disabled={busy !== null} onClick={() => void disableAutomation()}>{busy === "disable-automation" ? "Disabling…" : "Disable automation"}</button>}</div>
+        </form>
+        <div className="mt-6 border-t border-slate-200 pt-5">
+          <h3 className="font-semibold text-slate-900">Draft-specific authorizations</h3>
+          <p className="mt-1 text-sm text-slate-500">One-click sends create audit authorizations bound to the exact generated draft, recipient, Gmail identity, attachment checksum, and outreach type.</p>
+          <div className="mt-3 space-y-2">{automaticAuthorizations.length === 0 ? <p className="text-sm text-slate-500">No draft-specific authorizations.</p> : automaticAuthorizations.map((authorization) => <div key={authorization.id} className="flex flex-col gap-3 rounded-lg border border-slate-200 p-3 sm:flex-row sm:items-center sm:justify-between"><div><p className="text-sm font-semibold text-slate-900">{authorization.authorization_kind === "initial" ? "Initial outreach" : "Follow-up"} to {authorization.recipient_email}</p><p className="mt-1 text-xs text-slate-500">{authorization.revoked_at ? `Revoked: ${authorization.revocation_reason || "revoked"}` : "Active automatic-send audit authorization"}</p></div>{!authorization.revoked_at && <button type="button" className="button-danger" disabled={busy !== null} onClick={() => void revokeAuthorization(authorization.id)}>Revoke</button>}</div>)}</div>
         </div>
       </section>
 

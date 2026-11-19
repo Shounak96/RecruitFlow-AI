@@ -2,7 +2,7 @@
 
 ## Product scope (V1)
 
-RecruitFlow AI is a cost-conscious, production-quality web application for AI-assisted recruiter outreach. V1 will let a user connect their own Gmail account; maintain a sender profile, multiple resumes, and reusable email-purpose descriptions; provide recruiter and optional job context; select a purpose and resume; independently choose whether to attach that resume; generate and edit an email subject and body; explicitly approve every initial email and follow-up; send through Gmail; and view message/thread history with follow-ups kept in the original Gmail thread.
+RecruitFlow AI is a cost-conscious web application for AI-assisted recruiter outreach. V1 established explicit per-message review and approval; V2.4 preserves that manual default while optionally allowing one explicit `Generate & Send Email` click to generate and immediately send initial outreach without preview. The app connects the user's Gmail account; maintains a sender profile, resumes, and email purposes; generates grounded drafts; sends through Gmail; and tracks threaded history and replies.
 
 ## Architecture decisions
 
@@ -26,6 +26,7 @@ RecruitFlow AI is a cost-conscious, production-quality web application for AI-as
 5.1. **Local deletion (complete):** owner-scoped draft removal and durable conversation tombstones that hide RecruitFlow records without changing Gmail messages or discarding send-safety metadata.
 5.2. **Manual Gmail reply sync (complete):** read-scope-aware reconnection, bounded user-triggered reads of known non-deleted Gmail threads, safe incoming-message parsing and persistence, and chronological History display with local new-reply state.
 5.3. **AI responses to received replies (complete):** grounded reply drafting from chronological sent/received context, optional user instructions, normal Compose editing/refinement, received-message-bound approval snapshots, and explicit same-thread Gmail sending.
+5.4. **Controlled automatic sending, Stages A–B (complete):** persisted manual-by-default preferences, explicit opt-in metadata, exact draft/recipient/Gmail-identity/attachment-bound authorizations, transaction-safe UTC daily claims, and a separate user-triggered dispatch action. There is no scheduler or background dispatch.
 6. **Production hardening:** real authentication/authorization, rate limits, observability, accessibility, privacy/retention controls, end-to-end tests, and deployment runbooks.
 
 ## Explicit non-goals for V1
@@ -34,7 +35,7 @@ RecruitFlow AI is a cost-conscious, production-quality web application for AI-as
 - Autonomous outreach agents, queues, workflow engines, or extra services.
 - Non-Gmail providers, CRM/ATS integrations, campaign analytics, contact scraping, or lead discovery.
 - Paid AI or infrastructure dependencies as a requirement for local development.
-- Global inbox scanning/search, background reply polling, automatic retries, multi-user authentication, public deployment, scheduling, and automatic/bulk sending.
+- Global inbox scanning/search, background reply polling, automatic retries, multi-user authentication, public deployment, scheduling, autonomous sending, and bulk/campaign sending.
 
 ## Implemented Milestone 2 contract
 
@@ -54,6 +55,7 @@ Resume validation checks the upload media type plus PDF header and end marker. S
 - `PUT|DELETE /api/settings/purposes/{id}`
 - `PUT /api/settings/purposes/{id}/default`
 - `POST /api/drafts/generate`
+- `POST /api/drafts/generate-and-send`
 - `POST /api/drafts/{id}/refine`
 - `GET /api/drafts`
 - `GET|PUT|DELETE /api/drafts/{id}`
@@ -71,6 +73,12 @@ Resume validation checks the upload media type plus PDF header and end marker. S
 - `POST /api/gmail/replies/sync`
 - `POST /api/replies/generate`
 - `POST /api/followups/generate`
+- `GET|PUT /api/settings/sending-preferences`
+- `POST /api/settings/sending-preferences/disable`
+- `GET|POST /api/settings/automatic-authorizations`
+- `GET /api/settings/automatic-authorizations/preview/{draft_id}`
+- `DELETE /api/settings/automatic-authorizations/{authorization_id}`
+- `POST /api/gmail/automatic-sends/{authorization_id}`
 
 ## Implemented Milestone 3 contract
 
@@ -127,4 +135,18 @@ History exposes **Generate AI Reply** only when an active conversation has an el
 Each reply draft stores the exact received-message ID it answers and opens in the existing Compose editor. The application, not AI output, fixes the recipient to the latest permitted inbound sender and normalizes the thread subject. Reply drafts support normal manual edits, persistence, proposal-only AI refinement, attachment selection, immutable review, and explicit approval. Generation, refinement, saving, and review preparation never send email.
 
 The send review snapshots the received-message reference and a SHA-256 context fingerprint. Review and dispatch revalidate the live root tombstone, authenticated sender, Gmail thread, latest inbound ordering, participant identities, recipient, inbound content, latest outgoing parent, draft fingerprint, and attachment. A newer synced reply immediately makes a pending reply review stale. Confirmed replies use the original Gmail `threadId`, the inbound RFC Message-ID as `In-Reply-To`, accumulated stored RFC IDs in `References`, and the existing duplicate/concurrent-send and uncertain-delivery safeguards. One non-deleted draft or confirmed/uncertain send may respond to a given inbound message; subsequent replies require a newer synced message.
+
+## Implemented V2.4 controlled automatic sending
+
+All owners remain in persisted `manual` mode by default, including owners backfilled by migration `0011`. Switching to `automatic` requires an explicit confirmation stored with a consent timestamp, at least one independently enabled category (initial outreach or follow-ups), and a custom positive-integer UTC daily limit. New preferences default to 5, and both API and database validation enforce a maximum of 500. Migration `0012` changes only the constraint and default, preserving every existing owner's stored limit, permissions, authorizations, and claims. The limit is a safety maximum, not a guarantee of Gmail or AI-provider deliverability. Returning to manual mode or using the dedicated disable action revokes all active automatic-send authorizations.
+
+An automatic-send authorization is a separate audit record bound to one owner, unchanged eligible draft, exact recipient, verified Gmail address and Google subject, exact optional attachment metadata/SHA-256, and either initial-outreach or follow-up semantics. Migration `0013` adds the attachment binding without changing prior authorizations or claims; older attached-draft authorizations must be recreated before dispatch. Received-message reply drafts are never eligible. Draft edits, draft/conversation tombstones, Gmail disconnect, category disablement, manual review creation, and explicit revocation invalidate or revoke authorization. Validation also rejects changed Gmail identity, recipient/content/attachment state, missing consent, deleted or sent drafts, invalid follow-up roots, and any pending, sending, sent, or uncertain attempt.
+
+In manual mode, Compose retains `Generate Email -> edit/review -> approve -> send`. When automatic mode and automatic initial outreach are explicitly enabled, Compose instead shows an unmistakable warning and a `Generate & Send Email` action. That click is consent for one request: the backend binds a durable owner-scoped idempotency key to the exact submitted recipient, purpose, resume/attachment choice, job context, and verified Gmail identity. It generates and validates structured AI content, rechecks that purpose/profile/resume/Gmail context did not change, creates the exact draft authorization and immutable Gmail snapshot, claims UTC allowance, and dispatches through the shared MIME, row-lock, duplicate-prevention, and uncertain-outcome path. The generated text is not previewed before sending.
+
+Migration `0014` adds durable one-click request records with `generating`, `dispatching`, `sent`, `uncertain`, and `failed` states. A repeated key with identical input returns the same confirmed or uncertain result without another AI or Gmail call; reuse with different input is rejected. AI or definitive pre-dispatch failures create no daily claim. Ambiguous Gmail outcomes remain `uncertain`, consume the claim, and are never retried automatically. Automatic sends do not populate the manual `approved_at` field.
+
+One-click sending is limited to initial outreach. Follow-up and received-message reply generation, editing, review, and approval remain manual in the main UI. The previously implemented exact-draft follow-up dispatch safeguard remains fail-closed and performs one read-only `threads.get` for only its linked Gmail thread before claiming; missing read scope, read failure, mismatched participants, or a newer recipient response blocks it. Nothing scans the inbox.
+
+A locked owner preference row serializes UTC limit checks, while database uniqueness prevents multiple claims for one authorization. `claimed`, confirmed `sent`, and ambiguous `uncertain` outcomes count against the limit; definitive failures are marked `released`. An uncertain outcome is never retried automatically. There is no worker, scheduler, polling dispatch loop, campaign engine, bulk import, or autonomous recipient selection.
 

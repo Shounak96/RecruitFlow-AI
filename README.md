@@ -1,6 +1,6 @@
 # RecruitFlow AI
 
-RecruitFlow AI is a local-first web application for creating personalized recruiter outreach without surrendering control of the final message. It grounds AI-generated drafts in a selected resume, reusable outreach purpose, and job context, then requires the user to review and explicitly approve every email and follow-up before Gmail sends it.
+RecruitFlow AI is a local-first web application for personalized recruiter outreach. It grounds AI-generated drafts in a selected resume, reusable outreach purpose, and job context. Manual review is the default; an explicit opt-in mode offers one-click AI generation and immediate Gmail sending for initial outreach, with no background or scheduled dispatch.
 
 <!-- Screenshot placeholder: Compose, refinement, and final review workflow -->
 <!-- Screenshot placeholder: Settings, resumes, purposes, and Gmail connection -->
@@ -13,11 +13,12 @@ RecruitFlow AI is a local-first web application for creating personalized recrui
 - Edit persisted drafts or ask AI to refine the current subject and body with a free-text instruction; revisions are proposed separately and never silently overwrite the draft.
 - Use direct Google Gemini or OpenRouter through a shared provider boundary, with optional one-at-a-time failover for eligible temporary provider failures.
 - Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
-- Review an immutable server-side snapshot and explicitly approve every individual send. Draft generation, saving, refinement, and review preparation never send email.
+- Use the default immutable review and per-message approval flow, or explicitly click `Generate & Send Email` to generate and immediately send one initial-outreach email without preview.
 - Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
 - Manually sync recruiter replies only from Gmail thread IDs already saved by RecruitFlow, then view incoming and outgoing messages chronologically with local new-reply indicators.
 - Generate a grounded AI response to the latest eligible recruiter reply, edit or refine it in Compose, and send it in the same Gmail thread only after the normal final review and explicit approval.
 - Remove drafts or entire conversations from RecruitFlow locally without deleting or changing messages in Gmail.
+- Keep manual approval as the default, with optional one-click initial outreach protected by persisted opt-in, per-request consent, idempotency, daily limits, and the existing Gmail send state machine.
 - Keep global inbox scanning, automated outreach, scheduling, and background sending out of scope.
 
 ## Architecture
@@ -68,6 +69,7 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 - **Threaded follow-ups and bounded reply sync:** follow-ups retain Gmail thread IDs and RFC `Message-ID` values, supply `In-Reply-To` and `References`, and are rejected when same-thread delivery cannot be safely established. Reply sync is manual, reads at most 25 known non-deleted RecruitFlow threads per request, stores bounded plain text, and never searches the inbox, downloads attachments, changes labels, or marks Gmail messages read.
 - **Inbound-context-bound AI replies:** the latest eligible received-message ID and a content fingerprint are bound to the immutable send review. Newer, changed, removed, cross-thread, self-authored, alias, or unsupported group context is rejected. The recipient comes from validated Gmail state, never AI output, and every response still requires manual approval.
 - **Durable local deletion:** draft and conversation tombstones hide deleted records from normal APIs while preserving send snapshots, Gmail thread identifiers, and duplicate-send safeguards. Pending reviews become stale, active dispatches cannot be deleted, and no delete operation calls Gmail. Future synchronization must honor the root conversation tombstone.
+- **Controlled one-click dispatch:** persisted preferences default every owner to manual mode. In automatic initial-outreach mode, one explicit `Generate & Send Email` click reserves a durable idempotency key, generates validated grounded content, binds the exact recipient/Gmail identity/attachment checksum, and uses the shared Gmail snapshot, MIME, locking, duplicate-prevention, and uncertain-delivery state machine. AI/pre-dispatch failures consume no claim; uncertain delivery consumes the claim and cannot be retried automatically. Follow-ups and received-message replies remain manual in the main UI. There is no scheduler, background worker, bulk campaign, or automatic reply dispatch.
 
 ## Local setup on Windows
 
@@ -204,7 +206,7 @@ npm.cmd run build
 Set-Location ..
 ```
 
-Latest verified backend result: **141 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
+Latest verified backend result: **193 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
 
 ## Security limitations
 
@@ -215,6 +217,6 @@ A public deployment would require real authentication and session authorization,
 ## Roadmap
 
 - Production authentication, authorization, observability, privacy controls, accessibility review, and deployment runbooks.
-- Optional V2 automated sending only as an explicit opt-in feature with additional safeguards. It is not implemented in V1; every current email and follow-up requires manual review and approval.
+- Future work may add optional scheduling only after additional authorization, cancellation, operational monitoring, and abuse-prevention design. It is not implemented. Received-message replies always retain the normal manual review and approval workflow.
 
 Detailed product contracts and non-goals are maintained in [`docs/PROJECT.md`](docs/PROJECT.md).

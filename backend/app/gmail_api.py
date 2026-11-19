@@ -14,18 +14,29 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+from app.automatic_sending import (
+    AutomaticSendingError,
+    claim_automatic_send,
+    revoke_draft_authorizations,
+    revoke_owner_authorizations,
+    validate_automatic_authorization,
+)
 from app.database import get_db
+from app.draft_safety import draft_fingerprint
 from app.gmail_service import (
     GMAIL_READONLY_SCOPE,
     GMAIL_SCOPES,
     GmailConfigurationError,
     GmailCredentialError,
+    GmailReadPermissionError,
     GmailService,
     GmailUpstreamError,
     build_plain_text_message,
     get_gmail_service,
 )
 from app.models import (
+    AutomaticSendAuthorization,
+    AutomaticSendClaim,
     EmailDraft,
     EmailSend,
     GmailConnection,
@@ -34,7 +45,9 @@ from app.models import (
     Resume,
     SenderProfile,
 )
+from app.gmail_replies import parse_gmail_message
 from app.schemas import (
+    AutomaticSendDispatch,
     GmailAuthorizationResponse,
     GmailReviewResponse,
     GmailSendApproval,
@@ -70,30 +83,6 @@ def _connection(db: Session, *, require_valid: bool = False) -> GmailConnection 
     if require_valid and (connection is None or not connection.is_valid):
         raise HTTPException(status_code=409, detail="Connect Gmail before sending.")
     return connection
-
-
-def _draft_fingerprint(draft: EmailDraft) -> str:
-    canonical = json.dumps(
-        {
-            "draft_id": str(draft.id),
-            "recipient_email": draft.recipient_email,
-            "subject": draft.subject,
-            "body": draft.body,
-            "attach_resume": draft.attach_resume,
-            "resume_id": str(draft.resume_id) if draft.resume_id else None,
-            "conversation_id": str(draft.conversation_id) if draft.conversation_id else None,
-            "reply_to_received_message_id": (
-                str(draft.reply_to_received_message_id)
-                if draft.reply_to_received_message_id
-                else None
-            ),
-            "reply_context_fingerprint": draft.reply_context_fingerprint,
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _review_response(send: EmailSend) -> GmailReviewResponse:
@@ -344,15 +333,19 @@ async def disconnect_gmail(
         ) from exc
     profile = _ensure_profile(db)
     profile.gmail_identity_reference = None
+    revoke_owner_authorizations(
+        db, _owner_id(), reason="gmail_disconnected", now=_utcnow()
+    )
     db.delete(connection)
     _commit(db)
     return Response(status_code=204)
 
 
-@router.post("/reviews/{draft_id}", response_model=GmailReviewResponse, status_code=201)
-def create_review(
+def _create_review_snapshot(
     draft_id: UUID,
-    db: Annotated[Session, Depends(get_db)],
+    db: Session,
+    *,
+    automatic_claim_id: UUID | None = None,
 ) -> GmailReviewResponse:
     connection = _connection(db, require_valid=True)
     draft = db.scalar(
@@ -368,6 +361,18 @@ def create_review(
         raise HTTPException(status_code=404, detail="Draft not found.")
     if draft.sent_at is not None:
         raise HTTPException(status_code=409, detail="This draft has already been sent.")
+    automatic_claim = db.scalar(
+        select(AutomaticSendClaim.id).where(
+            AutomaticSendClaim.owner_id == _owner_id(),
+            AutomaticSendClaim.draft_id == draft.id,
+            AutomaticSendClaim.status.in_(("claimed", "sent", "uncertain")),
+        )
+    )
+    if automatic_claim is not None and automatic_claim != automatic_claim_id:
+        raise HTTPException(
+            status_code=409,
+            detail="This draft already has an automatic-send claim.",
+        )
     active = db.scalar(
         select(EmailSend).where(
             EmailSend.draft_id == draft.id,
@@ -385,6 +390,10 @@ def create_review(
         .where(EmailSend.draft_id == draft.id, EmailSend.status == "pending")
         .values(status="stale")
     )
+    if automatic_claim_id is None:
+        revoke_draft_authorizations(
+            db, _owner_id(), draft.id, reason="manual_review_created"
+        )
 
     attachment_resume_id = None
     attachment_filename = None
@@ -502,7 +511,7 @@ def create_review(
         reply_to_received_message_id=reply_to_received_message_id,
         reply_context_fingerprint=reply_context_fingerprint,
         status="pending",
-        draft_fingerprint=_draft_fingerprint(draft),
+        draft_fingerprint=draft_fingerprint(draft),
         sender_email=connection.email,
         sender_name=profile.name,
         recipient_email=draft.recipient_email,
@@ -529,15 +538,22 @@ def create_review(
     return _review_response(send)
 
 
-@router.post("/sends/{send_id}", response_model=GmailSendResult)
-async def approve_and_send(
-    send_id: UUID,
-    payload: GmailSendApproval,
-    response: Response,
+@router.post("/reviews/{draft_id}", response_model=GmailReviewResponse, status_code=201)
+def create_review(
+    draft_id: UUID,
     db: Annotated[Session, Depends(get_db)],
-    service: Annotated[GmailService, Depends(get_gmail_service)],
+) -> GmailReviewResponse:
+    return _create_review_snapshot(draft_id, db)
+
+
+async def _dispatch_pending_send(
+    send_id: UUID,
+    response: Response,
+    db: Session,
+    service: GmailService,
+    *,
+    mark_manual_approval: bool,
 ) -> GmailSendResult:
-    del payload  # Literal[True] validation is the explicit approval signal.
     connection = _connection(db, require_valid=True)
     access_token = await _valid_access_token(connection, db, service)
 
@@ -614,7 +630,7 @@ async def approve_and_send(
                     status_code=409,
                     detail="The received-message context changed after review.",
                 )
-    if draft is None or draft.sent_at is not None or _draft_fingerprint(draft) != send.draft_fingerprint:
+    if draft is None or draft.sent_at is not None or draft_fingerprint(draft) != send.draft_fingerprint:
         send.status = "stale"
         _commit(db)
         raise HTTPException(
@@ -673,7 +689,8 @@ async def approve_and_send(
         raise HTTPException(status_code=409, detail="The reviewed email is invalid.") from exc
 
     send.status = "sending"
-    send.approved_at = _utcnow()
+    if mark_manual_approval:
+        send.approved_at = _utcnow()
     _commit(db)
     try:
         if send.intended_gmail_thread_id is None:
@@ -734,6 +751,199 @@ async def approve_and_send(
         gmail_thread_id=result.thread_id,
         sent_at=sent_at,
     )
+
+
+@router.post("/sends/{send_id}", response_model=GmailSendResult)
+async def approve_and_send(
+    send_id: UUID,
+    payload: GmailSendApproval,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
+    service: Annotated[GmailService, Depends(get_gmail_service)],
+) -> GmailSendResult:
+    del payload  # Literal[True] validation is the explicit approval signal.
+    return await _dispatch_pending_send(
+        send_id, response, db, service, mark_manual_approval=True
+    )
+
+
+async def _verify_followup_has_no_new_reply(
+    authorization: AutomaticSendAuthorization,
+    draft: EmailDraft,
+    connection: GmailConnection,
+    access_token: str,
+    db: Session,
+    service: GmailService,
+) -> None:
+    if draft.conversation_id is None:
+        return
+    if GMAIL_READONLY_SCOPE not in connection.scopes.split():
+        raise HTTPException(
+            status_code=409,
+            detail="Reconnect Gmail with read-only permission before automatically sending a follow-up.",
+        )
+    root = db.scalar(
+        select(EmailSend).where(
+            EmailSend.id == draft.conversation_id,
+            EmailSend.owner_id == authorization.owner_id,
+            EmailSend.conversation_id.is_(None),
+            EmailSend.status == "sent",
+            EmailSend.deleted_at.is_(None),
+        )
+    )
+    if root is None or not root.gmail_thread_id:
+        raise HTTPException(status_code=409, detail="The Gmail conversation is unavailable.")
+    messages = _conversation_messages(root, db)
+    parent = messages[-1]
+    if not parent.gmail_message_id:
+        raise HTTPException(
+            status_code=409,
+            detail="The latest sent message cannot be verified in Gmail.",
+        )
+    try:
+        thread = await service.get_thread(access_token, root.gmail_thread_id)
+    except GmailReadPermissionError as exc:
+        connection.scopes = " ".join(
+            scope for scope in connection.scopes.split() if scope != GMAIL_READONLY_SCOPE
+        )
+        _commit(db)
+        raise HTTPException(
+            status_code=409,
+            detail="Reconnect Gmail with read-only permission before automatically sending a follow-up.",
+        ) from exc
+    except GmailCredentialError as exc:
+        connection.is_valid = False
+        _commit(db)
+        raise HTTPException(status_code=409, detail="Reconnect Gmail before sending.") from exc
+    except GmailUpstreamError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Gmail could not verify whether the recipient replied. Automatic follow-up was blocked.",
+        ) from exc
+    raw_messages = thread.get("messages")
+    if thread.get("id") != root.gmail_thread_id or not isinstance(raw_messages, list):
+        raise HTTPException(
+            status_code=409,
+            detail="The Gmail thread could not be safely verified. Automatic follow-up was blocked.",
+        )
+    parent_index = next(
+        (
+            index
+            for index, item in enumerate(raw_messages)
+            if isinstance(item, dict) and item.get("id") == parent.gmail_message_id
+        ),
+        None,
+    )
+    if parent_index is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The latest sent message was not found in its Gmail thread.",
+        )
+    outgoing_ids = {item.gmail_message_id for item in messages if item.gmail_message_id}
+    for raw_message in raw_messages[parent_index + 1 :]:
+        if not isinstance(raw_message, dict):
+            raise HTTPException(
+                status_code=409,
+                detail="The Gmail thread contains an unverifiable newer message.",
+            )
+        parsed = parse_gmail_message(raw_message)
+        if parsed is None or parsed.gmail_thread_id != root.gmail_thread_id:
+            raise HTTPException(
+                status_code=409,
+                detail="The Gmail thread contains an unverifiable newer message.",
+            )
+        if parsed.gmail_message_id in outgoing_ids:
+            if parsed.sender_email != connection.email.lower():
+                raise HTTPException(status_code=409, detail="The Gmail thread participants changed.")
+            continue
+        if (
+            parsed.sender_email != root.recipient_email.lower()
+            or parsed.recipient_emails != frozenset({connection.email.lower()})
+        ):
+            raise HTTPException(status_code=409, detail="The Gmail thread participants changed.")
+        raise HTTPException(
+            status_code=409,
+            detail="The recipient replied after the latest sent message. Review the reply before sending again.",
+        )
+
+
+@router.post(
+    "/automatic-sends/{authorization_id}",
+    response_model=GmailSendResult,
+)
+async def run_authorized_send(
+    authorization_id: UUID,
+    payload: AutomaticSendDispatch,
+    response: Response,
+    db: Annotated[Session, Depends(get_db)],
+    service: Annotated[GmailService, Depends(get_gmail_service)],
+) -> GmailSendResult:
+    del payload  # Literal[True] is the explicit user-triggered dispatch signal.
+    owner_id = _owner_id()
+    connection = _connection(db, require_valid=True)
+    try:
+        authorization, draft, _ = validate_automatic_authorization(
+            db, owner_id, authorization_id
+        )
+        if draft.conversation_id is not None:
+            access_token = await _valid_access_token(connection, db, service)
+            await _verify_followup_has_no_new_reply(
+                authorization, draft, connection, access_token, db, service
+            )
+        claim = claim_automatic_send(db, owner_id, authorization_id)
+        review = _create_review_snapshot(
+            draft.id, db, automatic_claim_id=claim.id
+        )
+    except AutomaticSendingError as exc:
+        db.rollback()
+        authorization = db.scalar(
+            select(AutomaticSendAuthorization).where(
+                AutomaticSendAuthorization.id == authorization_id,
+                AutomaticSendAuthorization.owner_id == owner_id,
+                AutomaticSendAuthorization.revoked_at.is_(None),
+            )
+        )
+        if authorization is not None:
+            authorization.revoked_at = _utcnow()
+            authorization.revocation_reason = "automatic_validation_failed"
+            _commit(db)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HTTPException:
+        db.rollback()
+        authorization = db.scalar(
+            select(AutomaticSendAuthorization).where(
+                AutomaticSendAuthorization.id == authorization_id,
+                AutomaticSendAuthorization.owner_id == owner_id,
+                AutomaticSendAuthorization.revoked_at.is_(None),
+            )
+        )
+        if authorization is not None:
+            authorization.revoked_at = _utcnow()
+            authorization.revocation_reason = "automatic_precondition_failed"
+            _commit(db)
+        raise
+
+    try:
+        result = await _dispatch_pending_send(
+            review.id,
+            response,
+            db,
+            service,
+            mark_manual_approval=False,
+        )
+    except HTTPException:
+        db.rollback()
+        live_claim = db.get(AutomaticSendClaim, claim.id)
+        send = db.get(EmailSend, review.id)
+        if live_claim is not None:
+            live_claim.status = "uncertain" if send and send.status == "uncertain" else "released"
+            _commit(db)
+        raise
+    live_claim = db.get(AutomaticSendClaim, claim.id)
+    if live_claim is not None:
+        live_claim.status = "uncertain" if result.status == "uncertain" else "sent"
+        _commit(db)
+    return result
 
 
 @router.get("/history", response_model=list[GmailSendHistoryResponse])

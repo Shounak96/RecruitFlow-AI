@@ -25,6 +25,96 @@ class SenderProfileUpdate(BaseModel):
         return value
 
 
+class SendingPreferenceUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sending_mode: Literal["manual", "automatic"]
+    automatic_initial_outreach: bool = False
+    automatic_followups: bool = False
+    daily_send_limit: int = Field(default=5, ge=1, le=500, strict=True)
+    confirm_automatic_sending: bool = False
+
+    @model_validator(mode="after")
+    def validate_mode(self):
+        if self.sending_mode == "manual" and (
+            self.automatic_initial_outreach or self.automatic_followups
+        ):
+            raise ValueError("Manual mode cannot enable automatic send categories")
+        if self.sending_mode == "automatic" and not (
+            self.automatic_initial_outreach or self.automatic_followups
+        ):
+            raise ValueError("Select at least one automatic send category")
+        return self
+
+
+class SendingPreferenceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    sending_mode: Literal["manual", "automatic"]
+    automatic_initial_outreach: bool
+    automatic_followups: bool
+    daily_send_limit: int = Field(ge=1, le=500)
+    automation_consented_at: datetime | None
+    automation_disabled_at: datetime | None
+    stage_a_dispatch_enabled: Literal[False] = False
+
+
+class AutomaticSendAuthorizationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_id: UUID
+    recipient_email: str = Field(min_length=3, max_length=320)
+    approved: Literal[True]
+
+    @field_validator("recipient_email")
+    @classmethod
+    def clean_recipient(cls, value: str) -> str:
+        value = value.strip().lower()
+        local, separator, domain = value.rpartition("@")
+        if not separator or not local or "." not in domain or any(char.isspace() for char in value):
+            raise ValueError("Enter a valid recipient email address")
+        return value
+
+
+class AutomaticSendAuthorizationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    draft_id: UUID
+    authorization_kind: Literal["initial", "follow_up"]
+    recipient_email: str
+    sender_email: str
+    attachment_filename: str | None
+    attachment_size_bytes: int | None
+    authorized_at: datetime
+    revoked_at: datetime | None
+    revocation_reason: str | None
+
+
+class AutomaticSendAttachmentResponse(BaseModel):
+    filename: str
+    size_bytes: int
+
+
+class AutomaticSendPreviewResponse(BaseModel):
+    draft_id: UUID
+    authorization_id: UUID | None = None
+    authorization_status: Literal["eligible", "authorized", "sent", "uncertain"]
+    sender_email: str
+    recipient_email: str
+    subject: str
+    body: str
+    attachment: AutomaticSendAttachmentResponse | None
+    remaining_today: int
+    daily_limit: int
+
+
+class AutomaticSendDispatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_authorized_send: Literal[True]
+
+
 class ResumeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -113,6 +203,10 @@ class DraftContext(BaseModel):
 
 class EmailGenerationRequest(DraftContext):
     draft_id: UUID | None = None
+
+
+class AutomaticEmailGenerationRequest(DraftContext):
+    idempotency_key: UUID
 
 
 class EmailDraftUpdate(DraftContext):
@@ -206,6 +300,10 @@ class GmailSendResult(BaseModel):
     gmail_message_id: str | None = None
     gmail_thread_id: str | None = None
     sent_at: datetime | None = None
+
+
+class AutomaticEmailSendResult(GmailSendResult):
+    idempotency_key: UUID
 
 
 class GmailSendHistoryResponse(BaseModel):

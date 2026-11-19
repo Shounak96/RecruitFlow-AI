@@ -17,6 +17,7 @@ from app.ai_provider import (
     EmailGenerationContext,
     get_ai_provider,
 )
+from app.automatic_sending import revoke_draft_authorizations
 from app.database import get_db
 from app.drafts_api import _draft_response
 from app.gmail_api import _received_fingerprint, _valid_access_token
@@ -702,6 +703,9 @@ def delete_conversation(
         )
     deleted_at = datetime.now(timezone.utc)
     for draft in drafts:
+        revoke_draft_authorizations(
+            db, _owner_id(), draft.id, reason="conversation_deleted"
+        )
         draft.deleted_at = deleted_at
     for send in sends:
         if send.status == "pending":
