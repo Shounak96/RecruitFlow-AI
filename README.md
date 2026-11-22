@@ -12,7 +12,7 @@ RecruitFlow AI is a local-first web application for personalized recruiter outre
 - Maintain explicit education status, experience type/duration, categorized skills, validated professional links, and up to five ordered projects. Each project uses only a title, comma-separated technologies, and one free-text description; career facts are never inferred from dates.
 - Manage multiple private resumes and reusable, editable purposes such as cold outreach, referral requests, already-applied notes, and reconnections.
 - Edit persisted drafts or ask AI to refine the current subject and body with a free-text instruction; revisions are proposed separately and never silently overwrite the draft.
-- Use direct Google Gemini, free-only OpenRouter, or explicitly selected local Claude Haiku through a shared provider boundary, with optional one-at-a-time failover and an explicit paid opt-in for Haiku fallback.
+- Route the same structured generation context to Gemini 3.5 Flash-Lite first and, when explicitly enabled for local development, Claude Haiku 5.5 exactly once after an eligible transient failure. OpenRouter remains available as a separate free-only configuration, not as part of that active Gemini-to-Haiku route.
 - Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
 - Use the default immutable review and per-message approval flow, or explicitly click `Generate & Send Email` to generate and immediately send one initial-outreach email without preview.
 - Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
@@ -25,26 +25,86 @@ RecruitFlow AI is a local-first web application for personalized recruiter outre
 ## Architecture
 
 ```mermaid
-flowchart LR
-    U[Browser] -->|Compose, Settings, History| F[Next.js frontend]
-    F -->|JSON over localhost| B[FastAPI backend]
+flowchart TB
+    User[Browser]
 
-    B --> DB[(PostgreSQL)]
-    B --> FS[Private PDF storage]
-    B --> AI[AI provider boundary]
-    AI --> G[Google Gemini API]
-    AI --> O[OpenRouter API]
-    AI --> A[Anthropic Messages API\nexplicit local Haiku testing]
+    subgraph Frontend[Next.js frontend - localhost:3000]
+        Web[RecruitFlow UI]
+        Compose[Compose and Drafts]
+        ProfileUI[Professional Profile]
+        Settings[Settings]
+        History[History]
+        Web --> Compose
+        Web --> ProfileUI
+        Web --> Settings
+        Web --> History
+    end
 
-    B --> GS[Gmail service]
-    GS --> GO[Google OAuth and UserInfo]
-    GS --> GM[Gmail send and known-thread read APIs]
+    User --> Web
 
-    DB -->|Profiles, purposes, drafts,<br/>reviews, sends, history| B
-    FS -->|Resume text or approved attachment| B
+    subgraph Backend[FastAPI backend - localhost:8001]
+        API[Validated REST APIs]
+        ProfileAPI[Profile and purpose services]
+        Evidence[Job-aware evidence selection]
+        Context[Shared structured AI context]
+        DraftFlow[Draft persistence and refinement]
+        SendFlow[Review, approval, and guarded sending]
+        ReplyFlow[History, thread sync, follow-ups, and replies]
+
+        API --> ProfileAPI
+        API --> DraftFlow
+        API --> SendFlow
+        API --> ReplyFlow
+        ProfileAPI --> Evidence
+        Evidence --> Context
+        Context --> DraftFlow
+        DraftFlow --> SendFlow
+    end
+
+    Web -->|JSON over localhost APIs| API
+
+    subgraph Data[Local persistence]
+        DB[(PostgreSQL<br/>profiles, purposes, drafts,<br/>reviews, sends, replies, history)]
+        ProfileData[Professional Profile<br/>personal information<br/>education and experience<br/>skills and up to five projects<br/>professional links]
+        PDFs[(Private PDF storage<br/>optional Gmail attachments only)]
+        ProfileData --> DB
+    end
+
+    ProfileUI -->|save and load| ProfileAPI
+    ProfileAPI -->|read and write| DB
+    DraftFlow -->|read and write| DB
+    SendFlow -->|read and write| DB
+    ReplyFlow -->|read and write| DB
+    DB -->|Profile facts| Evidence
+    Compose -->|job description| Evidence
+    Compose -->|selected purpose| Context
+
+    subgraph Providers[AI providers]
+        Router[Provider router]
+        Gemini[Gemini 3.5 Flash-Lite<br/>primary]
+        Haiku[Claude Haiku 5.5<br/>paid development fallback<br/>eligible transient failures only<br/>cost guarded]
+        OpenRouter[OpenRouter<br/>optional free-only configuration<br/>outside active route]
+        Router -->|first attempt| Gemini
+        Router -.-> Haiku
+        Router -.-> OpenRouter
+    end
+
+    Context --> Router
+    Router -->|validated subject and body| DraftFlow
+
+    subgraph Google[Google services]
+        OAuth[OAuth and verified identity]
+        Gmail[Gmail API<br/>send and tracked threads.get]
+    end
+
+    PDFs -->|selected attachment bytes| SendFlow
+    SendFlow --> OAuth
+    ReplyFlow --> OAuth
+    SendFlow -->|approved or explicit one-click initial send| Gmail
+    Gmail -->|explicit sync of tracked threads| ReplyFlow
 ```
 
-AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI owns validation, provider calls, Gmail authorization, approval enforcement, persistence, and access to private resume files.
+AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI owns validation, evidence selection, provider calls, Gmail authorization, approval enforcement, persistence, and access to private resume files. There is no PDF-to-AI path: resumes are validated and stored privately, then read only when the user elects to attach one to a Gmail message.
 
 ## Tech stack
 
@@ -53,8 +113,9 @@ AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI 
 | Frontend | Next.js 16, React 19, TypeScript 5.9, Tailwind CSS 4 |
 | Backend | Python 3.12, FastAPI, Pydantic Settings, Uvicorn, HTTPX |
 | Data | PostgreSQL 16, SQLAlchemy 2, Psycopg 3, Alembic |
-| AI | Google Gemini `generateContent`, OpenRouter chat completions, Anthropic Messages structured output for explicit local Haiku testing, PyPDF text extraction |
+| AI | Google Gemini `generateContent`, Anthropic Messages structured output, optional free-only OpenRouter chat completions |
 | Email | Google OAuth 2.0, OpenID Connect user info, Gmail send and known-thread read APIs, Python MIME tooling |
+| File handling | Private generated PDF storage keys, upload validation, optional Gmail MIME attachments; no PDF extraction for AI generation |
 | Security | Fernet token encryption, hashed OAuth state, private generated resume storage keys |
 | Testing | pytest with PostgreSQL integration tests; TypeScript type checking and Next.js production builds |
 
@@ -63,7 +124,7 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 ## Engineering details
 
 - **Grounded, structured AI output:** the backend prepares one compact, labeled candidate background exclusively from explicit Profile fields and treats Profile, job, purpose, conversation, and refinement content as untrusted data. Every provider receives the same context and must return a bounded object containing exactly `subject` and `body`, which is validated before persistence. Initial outreach prioritizes supported professional history, then candidate-led role evidence, then one purpose-specific request. A conservative deterministic check rejects clear quantitative achievement metrics before manual persistence, refinement, or automatic dispatch while preserving legitimate degree labels, explicit experience duration, position numbers, and numeric job titles.
-- **Controlled provider failover:** failover is disabled by default. An explicitly configured distinct fallback is tried exactly once after a primary-provider rate limit, timeout/connectivity failure, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free; paid Haiku fallback is restricted to local development and guarded by an explicit cost ceiling.
+- **Controlled provider routing:** Gemini 3.5 Flash-Lite is the primary local model. Fallback remains disabled for fresh installs; explicitly enabling the Gemini-to-Haiku route in `APP_ENV=development` permits exactly one paid Haiku attempt after a Gemini rate limit, timeout/connectivity failure, or confirmed upstream 5xx response. Authentication, permission, configuration, input, grounding, and malformed-output failures do not trigger fallback. The preflight cost ceiling is an estimate, not an Anthropic account spending cap. OpenRouter rejects non-free models and is not consulted by the Gemini-to-Haiku route.
 - **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, `gmail.send`, and `gmail.readonly`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend. Existing send-only connections are never treated as read-authorized.
 - **Server-enforced approval:** preparing a review snapshots the authenticated sender, recipient, subject, body, draft fingerprint, and attachment metadata. The attachment size and SHA-256 digest are checked again at dispatch. Any intervening draft or conversation change makes the review stale.
 - **Duplicate-send prevention:** PostgreSQL uniqueness constraints, row locks, and durable `pending -> sending -> sent|failed|uncertain` transitions prevent the same approval from being dispatched twice by concurrent requests.
@@ -81,7 +142,7 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 - Node.js 20.9 or newer
 - Docker Desktop with Docker Compose
 - Windows PowerShell
-- A Google AI Studio API key or an OpenRouter key configured for an explicitly free model; an Anthropic key is optional for explicit local Haiku quality testing
+- A Google AI Studio API key; an Anthropic API key is required only when explicitly enabling the paid local Haiku fallback. OpenRouter remains an optional free-only alternative.
 - A Google Cloud OAuth Web application if Gmail sending will be tested
 
 Run these commands from the repository root unless the command changes directory.
@@ -106,7 +167,7 @@ All copied environment files are ignored by Git. The committed examples contain 
 
 ### 2. Configure an AI provider
 
-Edit `backend/.env`. Gemini is the local default:
+Edit `backend/.env`. The committed safe default uses Gemini and leaves fallback disabled:
 
 ```dotenv
 AI_PROVIDER=gemini
@@ -116,25 +177,25 @@ AI_FALLBACK_ENABLED=false
 AI_FALLBACK_PROVIDER=anthropic
 ```
 
-To use OpenRouter as the primary provider, set `AI_PROVIDER=openrouter`, provide `OPENROUTER_API_KEY`, and use `openrouter/free` or a model ID ending in `:free` for `OPENROUTER_MODEL`.
-
-Fallback is disabled by default. For an explicit local paid fallback, set `APP_ENV=development`, `AI_PROVIDER=gemini`, `AI_FALLBACK_ENABLED=true`, and `AI_FALLBACK_PROVIDER=anthropic`, then configure the allowlisted Haiku model, API key, and positive local cost ceiling. Gemini is attempted once; Haiku is attempted once only for a rate limit, timeout/connectivity failure, or upstream 5xx. Validation, grounding, authentication, permission, and configuration failures never fall back, and this route never chains into OpenRouter. The cost guard is an estimate, not an Anthropic billing cap.
-
-For an explicit paid Claude Haiku quality comparison in local Manual Approval mode, use:
+To opt into the active Gemini-primary, Haiku-fallback route used for local testing, configure:
 
 ```dotenv
 APP_ENV=development
-AI_PROVIDER=anthropic
-AI_FALLBACK_ENABLED=false
+AI_PROVIDER=gemini
+GEMINI_MODEL=gemini-3.5-flash-lite
+AI_FALLBACK_ENABLED=true
+AI_FALLBACK_PROVIDER=anthropic
 ANTHROPIC_API_KEY=replace-with-your-key
 ANTHROPIC_MODEL=claude-haiku-5-5
 ANTHROPIC_TIMEOUT_SECONDS=45
 ANTHROPIC_MAX_ESTIMATED_COST_USD=0.01
 ```
 
-Only `claude-haiku-5-5` is accepted. Anthropic is blocked outside `APP_ENV=development`; selecting it as `AI_FALLBACK_PROVIDER` is an explicit paid opt-in and still requires its key and positive cost guard. The guard uses a deliberately conservative local token estimate and bounded 768-token output; it is not Anthropic tokenization or an account-level billing cap.
+Gemini is attempted once. Haiku is attempted at most once, and only after an eligible Gemini rate limit, timeout/connectivity failure, or upstream 5xx response. Validation, grounding, authentication, permission, and configuration failures do not fall back. Only `claude-haiku-5-5` is accepted, Anthropic is blocked outside `APP_ENV=development`, and the positive cost guard is checked before the request. The estimate is neither Anthropic tokenization nor an account-level billing cap.
 
-Restart the backend after changing `.env`. In Settings, keep **Manual Approval** selected and disable automatic sending. Confirm the saved sender profile, select the intended resume and Referral purpose in Compose, paste the actual job description, and click **Generate Email**. Review the subject, factual claims, purpose-specific request, and paragraph structure. Do not open Gmail review, approve, or send during the quality comparison. Restore `AI_PROVIDER=gemini` and restart the backend when finished.
+OpenRouter is retained as an optional provider. To select it explicitly, set `AI_PROVIDER=openrouter`, provide `OPENROUTER_API_KEY`, and use `openrouter/free` or a model ID ending in `:free` for `OPENROUTER_MODEL`. OpenRouter is never chained after Haiku and is not part of the Gemini-to-Haiku route.
+
+Restart the backend after changing `.env`. Before enabling one-click sending, keep **Manual Approval** selected, complete the Professional Profile, choose the intended purpose, and compare generated output against the supplied job description. Select a resume only when it should be attached; its PDF text is not used for generation.
 
 ### 3. Configure Google OAuth
 
@@ -184,8 +245,12 @@ docker compose ps
 
 Set-Location backend
 & ..\.venv\Scripts\python.exe -m alembic upgrade head
+& ..\.venv\Scripts\python.exe -m alembic current
+& ..\.venv\Scripts\python.exe -m alembic check
 Set-Location ..
 ```
+
+Migration `0015` creates the structured Professional Profile and draft Profile/link snapshots. Migration `0016` consolidates legacy project details into the current title/technologies/description shape while retaining legacy columns as a staged safety measure.
 
 ### 5. Run the application
 
