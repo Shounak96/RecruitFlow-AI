@@ -17,6 +17,7 @@ from app.ai_provider import (
     AIUnavailableError,
     EmailGenerationContext,
     get_ai_provider,
+    validate_generated_email,
 )
 from app.automatic_sending import (
     AutomaticSendingError,
@@ -35,9 +36,13 @@ from app.models import (
     EmailSend,
     ReceivedGmailMessage,
     Resume,
+    ProfessionalProfile,
     SenderProfile,
 )
-from app.resume_text import ResumeExtractionError, extract_resume_text
+from app.profile_service import (
+    append_signature_links, profile_snapshot, remove_signature_links,
+    selected_links, snapshot_fingerprint,
+)
 from app.schemas import (
     AutomaticEmailGenerationRequest,
     AutomaticEmailSendResult,
@@ -73,6 +78,36 @@ def _owned_resume(resume_id: UUID | None, db: Session) -> Resume | None:
     if resume is None:
         raise HTTPException(status_code=404, detail="Resume not found.")
     return resume
+
+
+def _professional_profile(db: Session) -> ProfessionalProfile:
+    profile = db.scalar(
+        select(ProfessionalProfile).where(ProfessionalProfile.owner_id == _owner_id())
+    )
+    if profile is None:
+        legacy = db.scalar(select(SenderProfile).where(SenderProfile.owner_id == _owner_id()))
+        if legacy is not None and legacy.name.strip():
+            profile = ProfessionalProfile(owner_id=_owner_id(), full_name=legacy.name)
+            db.add(profile); db.flush()
+    if profile is None or not profile.full_name.strip():
+        raise HTTPException(status_code=422, detail="Complete your professional Profile before generating email.")
+    return profile
+
+
+def _profile_generation_state(payload, db: Session) -> tuple[dict, str, dict[str, str]]:
+    profile = _professional_profile(db)
+    snapshot = profile_snapshot(db, _owner_id(), payload.job_description)
+    links = selected_links(
+        profile, github=payload.include_github,
+        linkedin=payload.include_linkedin, portfolio=payload.include_portfolio,
+    )
+    if payload.include_github and "GitHub" not in links:
+        raise HTTPException(status_code=422, detail="Add a GitHub URL to Profile before including it.")
+    if payload.include_linkedin and "LinkedIn" not in links:
+        raise HTTPException(status_code=422, detail="Add a LinkedIn URL to Profile before including it.")
+    if payload.include_portfolio and "Portfolio" not in links:
+        raise HTTPException(status_code=422, detail="Add a portfolio URL to Profile before including it.")
+    return snapshot, snapshot_fingerprint(snapshot), links
 
 
 def _owned_draft(
@@ -133,9 +168,12 @@ def _draft_response(draft: EmailDraft, db: Session) -> EmailDraftResponse:
         if draft.conversation_id is not None
         else "initial"
     )
-    return response.model_copy(
-        update={"refinement_allowed": _refinement_allowed(draft, db), "draft_kind": kind}
-    )
+    links = draft.included_profile_links or {}
+    return response.model_copy(update={
+        "refinement_allowed": _refinement_allowed(draft, db), "draft_kind": kind,
+        "include_github": "GitHub" in links, "include_linkedin": "LinkedIn" in links,
+        "include_portfolio": "Portfolio" in links,
+    })
 
 
 def _reply_subject(subject: str) -> str:
@@ -242,9 +280,9 @@ def _apply_context(draft: EmailDraft, payload: EmailGenerationRequest | EmailDra
 def _generation_context(
     *,
     payload: EmailGenerationRequest | EmailRefinementRequest,
-    profile: SenderProfile,
+    sender_name: str,
     purpose: EmailPurpose,
-    resume_text: str | None,
+    profile_context: dict,
     current_subject: str | None = None,
     current_body: str | None = None,
     refinement_instruction: str | None = None,
@@ -254,16 +292,16 @@ def _generation_context(
     is_reply: bool = False,
 ) -> EmailGenerationContext:
     return EmailGenerationContext(
-        sender_name=profile.name,
+        sender_name=sender_name,
         recipient_name=payload.recipient_name,
         company=payload.company,
         role=payload.role,
         job_description=payload.job_description,
         purpose_title=purpose.title,
         purpose_description=purpose.description,
-        resume_text=resume_text,
         resume_selected=payload.resume_id is not None,
         attach_resume=payload.attach_resume,
+        profile_context=profile_context,
         current_subject=current_subject,
         current_body=current_body,
         refinement_instruction=refinement_instruction,
@@ -341,30 +379,19 @@ async def generate_draft(
             )
     purpose = _owned_purpose(payload.purpose_id, db)
     resume = _owned_resume(payload.resume_id, db)
-    profile = db.scalar(
-        select(SenderProfile).where(SenderProfile.owner_id == _owner_id())
-    )
-    if profile is None or not profile.name.strip():
-        raise HTTPException(status_code=422, detail="Set a sender name in Settings first.")
-
-    resume_text = None
-    if resume is not None:
-        path = _storage_path(resume.storage_key)
-        if not path.is_file():
-            raise HTTPException(status_code=422, detail="The selected resume file is unavailable.")
-        try:
-            resume_text = extract_resume_text(path)
-        except ResumeExtractionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    profile = _professional_profile(db)
+    profile_context, profile_fingerprint, links = _profile_generation_state(payload, db)
 
     context = _generation_context(
         payload=payload,
-        profile=profile,
+        sender_name=profile.full_name,
         purpose=purpose,
-        resume_text=resume_text,
+        profile_context=profile_context,
     )
     try:
-        generated = await provider.generate_email(context)
+        generated = validate_generated_email(
+            context, await provider.generate_email(context)
+        )
     except AIRateLimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except AITimeoutError as exc:
@@ -375,14 +402,16 @@ async def generate_draft(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     if payload.draft_id is None:
-        draft = EmailDraft(owner_id=_owner_id(), subject=generated.subject, body=generated.body)
+        draft = EmailDraft(owner_id=_owner_id(), subject=generated.subject, body=append_signature_links(generated.body, links))
         db.add(draft)
     else:
         draft = _owned_draft(payload.draft_id, db, for_update=True)
         _ensure_unsent(draft, db)
         _invalidate_pending_reviews(draft.id, db)
         draft.subject = generated.subject
-        draft.body = generated.body
+        draft.body = append_signature_links(generated.body, links)
+    draft.profile_fingerprint = profile_fingerprint
+    draft.included_profile_links = links
     _apply_context(draft, payload)
     _commit(db)
     db.refresh(draft)
@@ -432,16 +461,11 @@ async def generate_and_send_automatically(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     purpose = _owned_purpose(payload.purpose_id, db)
     resume = _owned_resume(payload.resume_id, db)
-    profile = db.scalar(
-        select(SenderProfile).where(SenderProfile.owner_id == owner_id)
-    )
-    if profile is None or not profile.name.strip():
-        raise HTTPException(status_code=422, detail="Set a sender name in Settings first.")
+    profile = _professional_profile(db)
+    profile_context, profile_fingerprint, links = _profile_generation_state(payload, db)
 
     purpose_snapshot = (purpose.title, purpose.description, purpose.updated_at)
-    profile_name = profile.name
     gmail_identity = (connection.email.lower(), connection.google_subject)
-    resume_text = None
     resume_checksum = None
     if resume is not None:
         path = _storage_path(resume.storage_key)
@@ -450,17 +474,14 @@ async def generate_and_send_automatically(
         try:
             resume_bytes = path.read_bytes()
             resume_checksum = hashlib.sha256(resume_bytes).hexdigest()
-            resume_text = extract_resume_text(path)
         except OSError as exc:
             raise HTTPException(status_code=422, detail="The selected resume file is unavailable.") from exc
-        except ResumeExtractionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     context = _generation_context(
         payload=payload,
-        profile=profile,
+        sender_name=profile.full_name,
         purpose=purpose,
-        resume_text=resume_text,
+        profile_context=profile_context,
     )
     request_row = AutomaticSendRequest(
         owner_id=owner_id,
@@ -481,7 +502,9 @@ async def generate_and_send_automatically(
     request_id = request_row.id
 
     try:
-        generated = await provider.generate_email(context)
+        generated = validate_generated_email(
+            context, await provider.generate_email(context)
+        )
     except AIRateLimitError as exc:
         _fail_automatic_request(db, request_id, category="ai_rate_limit")
         raise HTTPException(status_code=429, detail=str(exc)) from exc
@@ -502,9 +525,7 @@ async def generate_and_send_automatically(
             EmailPurpose.owner_id == owner_id,
         )
     )
-    live_profile = db.scalar(
-        select(SenderProfile).where(SenderProfile.owner_id == owner_id)
-    )
+    live_profile_snapshot = profile_snapshot(db, owner_id, payload.job_description)
     if live_purpose is None or (
         live_purpose.title,
         live_purpose.description,
@@ -512,7 +533,7 @@ async def generate_and_send_automatically(
     ) != purpose_snapshot:
         _fail_automatic_request(db, request_id, category="purpose_changed")
         raise HTTPException(status_code=409, detail="The selected email purpose changed during generation.")
-    if live_profile is None or live_profile.name != profile_name:
+    if snapshot_fingerprint(live_profile_snapshot) != profile_fingerprint:
         _fail_automatic_request(db, request_id, category="sender_profile_changed")
         raise HTTPException(status_code=409, detail="The sender profile changed during generation.")
     if resume is not None:
@@ -543,7 +564,11 @@ async def generate_and_send_automatically(
         _fail_automatic_request(db, request_id, category="gmail_identity_changed")
         raise HTTPException(status_code=409, detail="The Gmail sender identity changed during generation.")
 
-    draft = EmailDraft(owner_id=owner_id, subject=generated.subject, body=generated.body)
+    draft = EmailDraft(
+        owner_id=owner_id, subject=generated.subject,
+        body=append_signature_links(generated.body, links),
+        profile_fingerprint=profile_fingerprint, included_profile_links=links,
+    )
     db.add(draft)
     _apply_context(draft, payload)
     try:
@@ -595,21 +620,8 @@ async def refine_draft(
     root = _validate_followup_payload(draft, payload, db)
     purpose = _owned_purpose(payload.purpose_id, db)
     resume = _owned_resume(payload.resume_id, db)
-    profile = db.scalar(
-        select(SenderProfile).where(SenderProfile.owner_id == _owner_id())
-    )
-    if profile is None or not profile.name.strip():
-        raise HTTPException(status_code=422, detail="Set a sender name in Settings first.")
-
-    resume_text = None
-    if resume is not None:
-        path = _storage_path(resume.storage_key)
-        if not path.is_file():
-            raise HTTPException(status_code=422, detail="The selected resume file is unavailable.")
-        try:
-            resume_text = extract_resume_text(path)
-        except ResumeExtractionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    profile = _professional_profile(db)
+    profile_context, _, links = _profile_generation_state(payload, db)
 
     conversation_history: tuple[dict[str, str], ...] = ()
     is_reply = draft.reply_to_received_message_id is not None
@@ -668,18 +680,20 @@ async def refine_draft(
             )
     context = _generation_context(
         payload=payload,
-        profile=profile,
+        sender_name=profile.full_name,
         purpose=purpose,
-        resume_text=resume_text,
+        profile_context=profile_context,
         current_subject=payload.subject,
-        current_body=payload.body,
+        current_body=remove_signature_links(payload.body, draft.included_profile_links or {}),
         refinement_instruction=payload.instruction,
         conversation_history=conversation_history,
         is_followup=root is not None and not is_reply,
         is_reply=is_reply,
     )
     try:
-        revision = await provider.generate_email(context)
+        revision = validate_generated_email(
+            context, await provider.generate_email(context)
+        )
     except AIRateLimitError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except AITimeoutError as exc:
@@ -691,7 +705,7 @@ async def refine_draft(
     _owned_draft(draft_id, db)
     return EmailRevisionResponse(
         subject=_reply_subject(root.subject) if root is not None else revision.subject,
-        body=revision.body,
+        body=append_signature_links(revision.body, links),
     )
 
 
@@ -732,9 +746,14 @@ def update_draft(
     revoke_draft_authorizations(
         db, _owner_id(), draft.id, reason="draft_changed"
     )
+    _, profile_fingerprint, links = _profile_generation_state(payload, db)
     _apply_context(draft, payload)
     draft.subject = payload.subject
-    draft.body = payload.body
+    draft.body = append_signature_links(
+        remove_signature_links(payload.body, draft.included_profile_links or {}), links
+    )
+    draft.profile_fingerprint = profile_fingerprint
+    draft.included_profile_links = links
     _commit(db)
     db.refresh(draft)
     return _draft_response(draft, db)

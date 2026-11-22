@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import { apiRequest, apiUrl } from "@/lib/api";
@@ -44,7 +45,6 @@ export function SettingsDashboard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [senderName, setSenderName] = useState("");
   const [resumeName, setResumeName] = useState("");
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [purposeTitle, setPurposeTitle] = useState("");
@@ -68,7 +68,6 @@ export function SettingsDashboard() {
         apiRequest<AutomaticAuthorization[]>("/api/settings/automatic-authorizations"),
       ]);
       setProfile(profileData);
-      setSenderName(profileData.name);
       setResumes(resumeData);
       setPurposes(purposeData);
       setSendingPreferences(preferenceData);
@@ -105,25 +104,6 @@ export function SettingsDashboard() {
   function notify(message: string) {
     setError(null);
     setSuccess(message);
-  }
-
-  async function saveProfile(event: FormEvent) {
-    event.preventDefault();
-    setBusy("profile");
-    setSuccess(null);
-    try {
-      const saved = await apiRequest<Profile>("/api/settings/profile", {
-        method: "PUT",
-        body: JSON.stringify({ name: senderName }),
-      });
-      setProfile(saved);
-      setSenderName(saved.name);
-      notify("Sender profile saved.");
-    } catch (saveError) {
-      setError(messageFrom(saveError));
-    } finally {
-      setBusy(null);
-    }
   }
 
   async function connectGmail() {
@@ -316,21 +296,15 @@ export function SettingsDashboard() {
       <section className="card p-5 sm:p-7" aria-labelledby="sender-heading">
         <div className="mb-6 flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
           <div>
-            <h2 id="sender-heading" className="text-lg font-bold text-slate-950">Sender profile</h2>
-            <p className="mt-1 text-sm leading-6 text-slate-500">Used to personalize future email drafts.</p>
+            <h2 id="sender-heading" className="text-lg font-bold text-slate-950">Gmail connection</h2>
+            <p className="mt-1 text-sm leading-6 text-slate-500">Career facts and sender name are managed on the separate Profile page.</p>
           </div>
           <span className={`inline-flex w-fit items-center gap-2 rounded-full px-3 py-1.5 text-sm font-semibold ${profile?.gmail_connected ? "bg-emerald-100 text-emerald-900 dark:bg-emerald-950/60 dark:text-emerald-200" : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-200"}`}>
             <span className={`size-2 rounded-full ${profile?.gmail_connected ? "bg-emerald-600 dark:bg-emerald-400" : "bg-slate-400 dark:bg-slate-500"}`} aria-hidden="true" />
             Gmail: {profile?.gmail_connected ? "Connected" : "Not connected"}
           </span>
         </div>
-        <form onSubmit={saveProfile} className="flex max-w-2xl flex-col gap-3 sm:flex-row sm:items-end">
-          <div className="flex-1">
-            <label htmlFor="sender-name" className="mb-2 block text-sm font-semibold text-slate-700">Sender name</label>
-            <input id="sender-name" className="field" value={senderName} onChange={(e) => setSenderName(e.target.value)} maxLength={120} required />
-          </div>
-          <button className="button-primary" disabled={busy === "profile"}>{busy === "profile" ? "Saving…" : "Save profile"}</button>
-        </form>
+        <Link href="/profile" className="button-secondary">Open professional Profile</Link>
         <div className="mt-5 flex flex-col gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p className="font-semibold text-slate-900">Verified Gmail identity</p>

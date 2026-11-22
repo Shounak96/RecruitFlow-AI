@@ -19,7 +19,7 @@ from app.ai_provider import (
 )
 from app.automatic_sending import revoke_draft_authorizations
 from app.database import get_db
-from app.drafts_api import _draft_response
+from app.drafts_api import _draft_response, _professional_profile
 from app.gmail_api import _received_fingerprint, _valid_access_token
 from app.gmail_replies import clean_received_body, parse_gmail_message
 from app.gmail_service import (
@@ -38,9 +38,8 @@ from app.models import (
     GmailConnection,
     ReceivedGmailMessage,
     Resume,
-    SenderProfile,
 )
-from app.resume_text import ResumeExtractionError, extract_resume_text
+from app.profile_service import profile_snapshot, snapshot_fingerprint
 from app.schemas import (
     ConversationDetail,
     EmailDraftResponse,
@@ -50,7 +49,7 @@ from app.schemas import (
     GmailReplySyncResponse,
     ReplyGenerationRequest,
 )
-from app.settings_api import _commit, _owner_id, _storage_path
+from app.settings_api import _commit, _owner_id
 
 
 router = APIRouter(tags=["history"])
@@ -539,14 +538,11 @@ async def generate_reply(
             EmailPurpose.owner_id == _owner_id(),
         )
     )
-    profile = db.scalar(
-        select(SenderProfile).where(SenderProfile.owner_id == _owner_id())
-    )
-    if purpose is None or profile is None or not profile.name.strip():
+    profile = _professional_profile(db)
+    if purpose is None:
         raise HTTPException(status_code=409, detail="The saved reply context is unavailable.")
 
     resume = None
-    resume_text = None
     if original.resume_id is not None:
         resume = db.scalar(
             select(Resume).where(
@@ -554,12 +550,6 @@ async def generate_reply(
                 Resume.owner_id == _owner_id(),
             )
         )
-        if resume is not None:
-            try:
-                resume_text = extract_resume_text(_storage_path(resume.storage_key))
-            except ResumeExtractionError:
-                resume = None
-                resume_text = None
 
     sent_messages = [root, *[item for item in _followups(root, db) if item.status == "sent"]]
     combined = [
@@ -586,16 +576,16 @@ async def generate_reply(
     )
     combined.sort(key=lambda item: item[0])
     context = EmailGenerationContext(
-        sender_name=profile.name,
+        sender_name=profile.full_name,
         recipient_name=latest.sender_name or latest.sender_email,
         company=original.company,
         role=original.role,
         job_description=original.job_description,
         purpose_title=purpose.title,
         purpose_description=purpose.description,
-        resume_text=resume_text,
         resume_selected=resume is not None,
         attach_resume=False,
+        profile_context=profile_snapshot(db, _owner_id(), original.job_description),
         conversation_history=tuple(item[1] for item in combined[-12:]),
         reply_guidance=payload.instructions,
         is_reply=True,
@@ -641,6 +631,7 @@ async def generate_reply(
         conversation_id=root.id,
         reply_to_received_message_id=latest.id,
         reply_context_fingerprint=selected_context_fingerprint,
+        profile_fingerprint=snapshot_fingerprint(context.profile_context or {}),
         recipient_name=latest.sender_name or latest.sender_email,
         recipient_email=latest.sender_email,
         company=original.company,
@@ -740,26 +731,17 @@ async def generate_followup(
             EmailPurpose.owner_id == _owner_id(),
         )
     )
-    profile = db.scalar(
-        select(SenderProfile).where(SenderProfile.owner_id == _owner_id())
-    )
-    if purpose is None or profile is None or not profile.name.strip():
+    profile = _professional_profile(db)
+    if purpose is None:
         raise HTTPException(status_code=409, detail="The saved follow-up context is unavailable.")
 
     resume = None
-    resume_text = None
     if original.resume_id is not None:
         resume = db.scalar(
             select(Resume).where(
                 Resume.id == original.resume_id, Resume.owner_id == _owner_id()
             )
         )
-        if resume is not None:
-            try:
-                resume_text = extract_resume_text(_storage_path(resume.storage_key))
-            except ResumeExtractionError:
-                resume = None
-                resume_text = None
 
     sent_messages = [root, *[item for item in _followups(root, db) if item.status == "sent"]]
     conversation_history = tuple(
@@ -767,16 +749,16 @@ async def generate_followup(
         for item in sent_messages[-10:]
     )
     context = EmailGenerationContext(
-        sender_name=profile.name,
+        sender_name=profile.full_name,
         recipient_name=original.recipient_name,
         company=original.company,
         role=original.role,
         job_description=original.job_description,
         purpose_title=purpose.title,
         purpose_description=purpose.description,
-        resume_text=resume_text,
         resume_selected=resume is not None,
         attach_resume=False,
+        profile_context=profile_snapshot(db, _owner_id(), original.job_description),
         conversation_history=conversation_history,
         followup_guidance=payload.guidance,
         is_followup=True,
@@ -798,6 +780,7 @@ async def generate_followup(
         purpose_id=purpose.id,
         resume_id=resume.id if resume else None,
         conversation_id=root.id,
+        profile_fingerprint=snapshot_fingerprint(context.profile_context or {}),
         recipient_name=original.recipient_name,
         recipient_email=root.recipient_email,
         company=original.company,

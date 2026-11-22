@@ -27,9 +27,10 @@ GENERATED_BODY = "Hi Taylor,\n\nI would value a brief conversation.\n\nBest,\nJo
 
 
 class OneClickProvider:
-    def __init__(self, *, error=None, callback=None) -> None:
+    def __init__(self, *, error=None, callback=None, body=GENERATED_BODY) -> None:
         self.error = error
         self.callback = callback
+        self.body = body
         self.contexts = []
 
     async def generate_email(self, context):
@@ -40,7 +41,7 @@ class OneClickProvider:
                 await result
         if self.error:
             raise self.error
-        return GeneratedEmail(subject="Generated introduction", body=GENERATED_BODY)
+        return GeneratedEmail(subject="Generated introduction", body=self.body)
 
 
 def payload(draft: EmailDraft, *, key=None, **overrides) -> dict:
@@ -135,6 +136,34 @@ def test_invalid_input_and_ai_failure_create_no_claim_or_send(db_session: Sessio
     assert service.send_calls == []
 
 
+def test_one_click_rejects_metric_output_before_claim_or_gmail_send(
+    db_session: Session,
+) -> None:
+    draft = seed_draft(db_session)
+    provider = OneClickProvider(
+        body=(
+            "Hi Taylor,\n\nI'm an M.S. in Computer Science candidate at Example "
+            "University. I supported 250K+ monthly requests.\n\n"
+            "Would you be open to referring me?\n\nBest,\nJordan"
+        )
+    )
+    service = AutomaticGmailService()
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    app.dependency_overrides[get_gmail_service] = lambda: service
+    enable_automation()
+
+    result = request("POST", "/api/drafts/generate-and-send", json=payload(draft))
+
+    assert result.status_code == 502
+    assert "quantitative achievement metrics" in result.json()["detail"]
+    db_session.expire_all()
+    request_row = db_session.scalar(select(AutomaticSendRequest))
+    assert request_row.status == "failed" and request_row.draft_id is None
+    assert db_session.scalar(select(AutomaticSendClaim)) is None
+    assert db_session.scalar(select(EmailSend)) is None
+    assert service.send_calls == []
+
+
 def test_daily_limit_is_checked_before_second_ai_generation(db_session: Session) -> None:
     draft = seed_draft(db_session)
     provider = OneClickProvider()
@@ -154,7 +183,10 @@ def test_attachment_change_during_generation_blocks_before_claim(
     db_session: Session, tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setattr(get_settings(), "resume_storage_path", tmp_path)
-    monkeypatch.setattr("app.drafts_api.extract_resume_text", lambda path: "Java experience")
+    monkeypatch.setattr(
+        "app.resume_text.extract_resume_text",
+        lambda path: (_ for _ in ()).throw(AssertionError("PDF extraction must not run")),
+    )
     draft = seed_draft(db_session)
     first_bytes = b"%PDF-1.4\nA\n%%EOF"
     second_bytes = b"%PDF-1.4\nB\n%%EOF"

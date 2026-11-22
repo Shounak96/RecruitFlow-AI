@@ -1,6 +1,6 @@
 # RecruitFlow AI
 
-RecruitFlow AI is a local-first web application for personalized recruiter outreach. It grounds AI-generated drafts in a selected resume, reusable outreach purpose, and job context. Manual review is the default; an explicit opt-in mode offers one-click AI generation and immediate Gmail sending for initial outreach, with no background or scheduled dispatch.
+RecruitFlow AI is a local-first web application for personalized recruiter outreach. It grounds AI-generated drafts in an explicit, persistent professional Profile, reusable outreach purpose, and job context; uploaded PDFs are optional Gmail attachments only and are never extracted for AI. Manual review is the default, while an explicit opt-in mode offers one-click AI generation and immediate Gmail sending for initial outreach with no background or scheduled dispatch.
 
 <!-- Screenshot placeholder: Compose, refinement, and final review workflow -->
 <!-- Screenshot placeholder: Settings, resumes, purposes, and Gmail connection -->
@@ -8,10 +8,11 @@ RecruitFlow AI is a local-first web application for personalized recruiter outre
 
 ## Implemented capabilities
 
-- Generate structured recruiter emails from a saved sender profile, selected PDF resume, outreach purpose, recipient details, and optional job description.
+- Generate structured recruiter emails from a saved professional Profile, outreach purpose, recipient details, and optional job description.
+- Maintain explicit education status, experience type/duration, categorized skills, validated professional links, and up to five ordered projects. Each project uses only a title, comma-separated technologies, and one free-text description; career facts are never inferred from dates.
 - Manage multiple private resumes and reusable, editable purposes such as cold outreach, referral requests, already-applied notes, and reconnections.
 - Edit persisted drafts or ask AI to refine the current subject and body with a free-text instruction; revisions are proposed separately and never silently overwrite the draft.
-- Use direct Google Gemini or OpenRouter through a shared provider boundary, with optional one-at-a-time failover for eligible temporary provider failures.
+- Use direct Google Gemini, free-only OpenRouter, or explicitly selected local Claude Haiku through a shared provider boundary, with optional one-at-a-time failover and an explicit paid opt-in for Haiku fallback.
 - Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
 - Use the default immutable review and per-message approval flow, or explicitly click `Generate & Send Email` to generate and immediately send one initial-outreach email without preview.
 - Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
@@ -33,6 +34,7 @@ flowchart LR
     B --> AI[AI provider boundary]
     AI --> G[Google Gemini API]
     AI --> O[OpenRouter API]
+    AI --> A[Anthropic Messages API\nexplicit local Haiku testing]
 
     B --> GS[Gmail service]
     GS --> GO[Google OAuth and UserInfo]
@@ -51,7 +53,7 @@ AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI 
 | Frontend | Next.js 16, React 19, TypeScript 5.9, Tailwind CSS 4 |
 | Backend | Python 3.12, FastAPI, Pydantic Settings, Uvicorn, HTTPX |
 | Data | PostgreSQL 16, SQLAlchemy 2, Psycopg 3, Alembic |
-| AI | Google Gemini `generateContent`, OpenRouter chat completions, PyPDF text extraction |
+| AI | Google Gemini `generateContent`, OpenRouter chat completions, Anthropic Messages structured output for explicit local Haiku testing, PyPDF text extraction |
 | Email | Google OAuth 2.0, OpenID Connect user info, Gmail send and known-thread read APIs, Python MIME tooling |
 | Security | Fernet token encryption, hashed OAuth state, private generated resume storage keys |
 | Testing | pytest with PostgreSQL integration tests; TypeScript type checking and Next.js production builds |
@@ -60,8 +62,8 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 
 ## Engineering details
 
-- **Grounded, structured AI output:** the shared prompt treats resume text, job descriptions, purposes, and refinement guidance as untrusted source data. Both providers must return a bounded object containing exactly `subject` and `body`, which is validated before persistence.
-- **Controlled provider failover:** failover is disabled by default. When enabled with a distinct provider, the backend tries it exactly once after a primary-provider rate limit, transport timeout, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free.
+- **Grounded, structured AI output:** the backend prepares one compact, labeled candidate background exclusively from explicit Profile fields and treats Profile, job, purpose, conversation, and refinement content as untrusted data. Every provider receives the same context and must return a bounded object containing exactly `subject` and `body`, which is validated before persistence. Initial outreach prioritizes supported professional history, then candidate-led role evidence, then one purpose-specific request. A conservative deterministic check rejects clear quantitative achievement metrics before manual persistence, refinement, or automatic dispatch while preserving legitimate degree labels, explicit experience duration, position numbers, and numeric job titles.
+- **Controlled provider failover:** failover is disabled by default. An explicitly configured distinct fallback is tried exactly once after a primary-provider rate limit, timeout/connectivity failure, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free; paid Haiku fallback is restricted to local development and guarded by an explicit cost ceiling.
 - **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, `gmail.send`, and `gmail.readonly`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend. Existing send-only connections are never treated as read-authorized.
 - **Server-enforced approval:** preparing a review snapshots the authenticated sender, recipient, subject, body, draft fingerprint, and attachment metadata. The attachment size and SHA-256 digest are checked again at dispatch. Any intervening draft or conversation change makes the review stale.
 - **Duplicate-send prevention:** PostgreSQL uniqueness constraints, row locks, and durable `pending -> sending -> sent|failed|uncertain` transitions prevent the same approval from being dispatched twice by concurrent requests.
@@ -79,7 +81,7 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 - Node.js 20.9 or newer
 - Docker Desktop with Docker Compose
 - Windows PowerShell
-- A Google AI Studio API key or an OpenRouter key configured for an explicitly free model
+- A Google AI Studio API key or an OpenRouter key configured for an explicitly free model; an Anthropic key is optional for explicit local Haiku quality testing
 - A Google Cloud OAuth Web application if Gmail sending will be tested
 
 Run these commands from the repository root unless the command changes directory.
@@ -111,12 +113,28 @@ AI_PROVIDER=gemini
 GEMINI_API_KEY=replace-with-your-key
 GEMINI_MODEL=gemini-3.5-flash-lite
 AI_FALLBACK_ENABLED=false
-AI_FALLBACK_PROVIDER=openrouter
+AI_FALLBACK_PROVIDER=anthropic
 ```
 
 To use OpenRouter as the primary provider, set `AI_PROVIDER=openrouter`, provide `OPENROUTER_API_KEY`, and use `openrouter/free` or a model ID ending in `:free` for `OPENROUTER_MODEL`.
 
-To enable optional failover, set `AI_FALLBACK_ENABLED=true`, choose the distinct fallback in `AI_FALLBACK_PROVIDER`, and configure that provider's key and model as well. There is no paid fallback or recursive retry. The application cannot verify a Google project's billing tier; confirm Free Tier status in Google AI Studio before use.
+Fallback is disabled by default. For an explicit local paid fallback, set `APP_ENV=development`, `AI_PROVIDER=gemini`, `AI_FALLBACK_ENABLED=true`, and `AI_FALLBACK_PROVIDER=anthropic`, then configure the allowlisted Haiku model, API key, and positive local cost ceiling. Gemini is attempted once; Haiku is attempted once only for a rate limit, timeout/connectivity failure, or upstream 5xx. Validation, grounding, authentication, permission, and configuration failures never fall back, and this route never chains into OpenRouter. The cost guard is an estimate, not an Anthropic billing cap.
+
+For an explicit paid Claude Haiku quality comparison in local Manual Approval mode, use:
+
+```dotenv
+APP_ENV=development
+AI_PROVIDER=anthropic
+AI_FALLBACK_ENABLED=false
+ANTHROPIC_API_KEY=replace-with-your-key
+ANTHROPIC_MODEL=claude-haiku-5-5
+ANTHROPIC_TIMEOUT_SECONDS=45
+ANTHROPIC_MAX_ESTIMATED_COST_USD=0.01
+```
+
+Only `claude-haiku-5-5` is accepted. Anthropic is blocked outside `APP_ENV=development`; selecting it as `AI_FALLBACK_PROVIDER` is an explicit paid opt-in and still requires its key and positive cost guard. The guard uses a deliberately conservative local token estimate and bounded 768-token output; it is not Anthropic tokenization or an account-level billing cap.
+
+Restart the backend after changing `.env`. In Settings, keep **Manual Approval** selected and disable automatic sending. Confirm the saved sender profile, select the intended resume and Referral purpose in Compose, paste the actual job description, and click **Generate Email**. Review the subject, factual claims, purpose-specific request, and paragraph structure. Do not open Gmail review, approve, or send during the quality comparison. Restore `AI_PROVIDER=gemini` and restart the backend when finished.
 
 ### 3. Configure Google OAuth
 
@@ -206,7 +224,7 @@ npm.cmd run build
 Set-Location ..
 ```
 
-Latest verified backend result: **193 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
+Latest verified backend result: **249 tests passed**. No live Gemini, OpenRouter, Anthropic, or Gmail requests are made by the automated tests.
 
 ## Security limitations
 

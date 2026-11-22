@@ -63,7 +63,8 @@ def isolated_app(test_engine, tmp_path) -> Generator[None, None, None]:
             text(
                 "TRUNCATE automatic_send_requests, automatic_send_claims, automatic_send_authorizations, sending_preferences, "
                 "received_gmail_messages, email_sends, gmail_oauth_states, gmail_connections, "
-                "email_drafts, email_purposes, resumes, sender_profiles "
+                "email_drafts, email_purposes, resumes, profile_projects, profile_skill_groups, "
+                "profile_experiences, profile_education, professional_profiles, sender_profiles "
                 "RESTART IDENTITY CASCADE"
             )
         )

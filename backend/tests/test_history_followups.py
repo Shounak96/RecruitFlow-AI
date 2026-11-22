@@ -150,6 +150,7 @@ def test_followup_generation_uses_only_sent_context_and_creates_separate_draft(
     assert data["subject"] == "Re: Platform engineering conversation"
     assert data["id"] != str(original.id)
     context = provider.contexts[0]
+    assert context.profile_context is not None
     assert context.is_followup is True
     assert context.followup_guidance == "Keep it short."
     assert context.conversation_history[0]["body"] == root.body

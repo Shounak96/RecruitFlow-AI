@@ -145,6 +145,7 @@ def test_reply_generation_uses_chronological_inbound_context_and_latest_sender(
     assert draft["recipient_email"] == latest.sender_email
     assert draft["subject"] == f"Re: {root.subject}"
     context = provider.contexts[0]
+    assert context.profile_context is not None
     assert context.is_reply is True and context.is_followup is False
     assert context.reply_guidance == "I'm free Wednesday after 2 PM"
     assert [item["direction"] for item in context.conversation_history] == [
@@ -436,7 +437,7 @@ def test_reply_timeout_then_rate_limited_fallback_reports_both_and_changes_nothi
 
     assert response.status_code == 429
     assert response.json()["detail"] == (
-        "Gemini timed out, and the OpenRouter free fallback is rate-limited. "
+        "Gemini timed out, and the OpenRouter fallback is rate-limited. "
         "No draft was created. Try again later."
     )
     assert len(primary.contexts) == 1

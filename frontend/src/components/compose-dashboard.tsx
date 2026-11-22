@@ -8,10 +8,12 @@ import { ApiError, apiRequest } from "@/lib/api";
 
 type Purpose = { id: string; title: string; description: string; is_default: boolean };
 type Resume = { id: string; display_name: string; is_default: boolean };
+type ProfileLinks = { github_url: string | null; linkedin_url: string | null; portfolio_url: string | null };
 type Draft = {
   id: string; recipient_name: string; recipient_email: string; company: string | null;
   role: string | null; job_description: string | null; purpose_id: string;
   resume_id: string | null; attach_resume: boolean; subject: string; body: string;
+  include_github: boolean; include_linkedin: boolean; include_portfolio: boolean;
   created_at: string; updated_at: string; status: "not_sent" | "sent";
   refinement_allowed: boolean;
   conversation_id: string | null;
@@ -32,6 +34,7 @@ type EmailRevision = { subject: string; body: string };
 const emptyForm = {
   recipient_name: "", recipient_email: "", company: "", role: "", job_description: "",
   purpose_id: "", resume_id: "", attach_resume: false, subject: "", body: "",
+  include_github: false, include_linkedin: false, include_portfolio: false,
 };
 
 function errorMessage(error: unknown): string {
@@ -46,6 +49,7 @@ function formatBytes(bytes: number): string {
 export function ComposeDashboard() {
   const [purposes, setPurposes] = useState<Purpose[]>([]);
   const [resumes, setResumes] = useState<Resume[]>([]);
+  const [profileLinks, setProfileLinks] = useState<ProfileLinks>({github_url:null,linkedin_url:null,portfolio_url:null});
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [currentStatus, setCurrentStatus] = useState<"not_sent" | "sent">("not_sent");
@@ -90,16 +94,18 @@ export function ComposeDashboard() {
   const loadLists = useCallback(async () => {
     setError(null);
     try {
-      const [purposeData, resumeData, draftData, gmailData, preferenceData] = await Promise.all([
+      const [purposeData, resumeData, draftData, gmailData, preferenceData, profileData] = await Promise.all([
         apiRequest<Purpose[]>("/api/settings/purposes"),
         apiRequest<Resume[]>("/api/settings/resumes"),
         apiRequest<Draft[]>("/api/drafts"),
         apiRequest<GmailStatus>("/api/gmail/status"),
         apiRequest<SendingPreferences>("/api/settings/sending-preferences"),
+        apiRequest<ProfileLinks>("/api/profile"),
       ]);
       setPurposes(purposeData); setResumes(resumeData); setDrafts(draftData);
       setGmail(gmailData);
       setSendingPreferences(preferenceData);
+      setProfileLinks(profileData);
       setForm((previous) => ({
         ...previous,
         purpose_id: previous.purpose_id || purposeData.find((item) => item.is_default)?.id || purposeData[0]?.id || "",
@@ -133,6 +139,9 @@ export function ComposeDashboard() {
       job_description: form.job_description || null, purpose_id: form.purpose_id,
       resume_id: form.resume_id || null,
       attach_resume: Boolean(form.resume_id && form.attach_resume),
+      include_github: form.include_github,
+      include_linkedin: form.include_linkedin,
+      include_portfolio: form.include_portfolio,
     };
   }
 
@@ -148,6 +157,8 @@ export function ComposeDashboard() {
       company: draft.company ?? "", role: draft.role ?? "",
       job_description: draft.job_description ?? "", purpose_id: draft.purpose_id,
       resume_id: draft.resume_id ?? "", attach_resume: draft.attach_resume && Boolean(draft.resume_id),
+      include_github: draft.include_github, include_linkedin: draft.include_linkedin,
+      include_portfolio: draft.include_portfolio,
       subject: draft.subject, body: draft.body,
     });
     setDirty(false); setError(null); setSuccess(null); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); oneClickRequestId.current = null;
@@ -178,7 +189,7 @@ export function ComposeDashboard() {
         });
         const completed = await apiRequest<Draft>(`/api/drafts/${result.draft_id}`);
         setCurrentId(completed.id); setCurrentStatus(completed.status); setCurrentConversationId(null); setCurrentDraftKind("initial"); setRefinementAllowed(completed.refinement_allowed);
-        setForm({ recipient_name: completed.recipient_name, recipient_email: completed.recipient_email, company: completed.company ?? "", role: completed.role ?? "", job_description: completed.job_description ?? "", purpose_id: completed.purpose_id, resume_id: completed.resume_id ?? "", attach_resume: completed.attach_resume, subject: completed.subject, body: completed.body });
+        setForm({ recipient_name: completed.recipient_name, recipient_email: completed.recipient_email, company: completed.company ?? "", role: completed.role ?? "", job_description: completed.job_description ?? "", purpose_id: completed.purpose_id, resume_id: completed.resume_id ?? "", attach_resume: completed.attach_resume, subject: completed.subject, body: completed.body, include_github: completed.include_github, include_linkedin: completed.include_linkedin, include_portfolio: completed.include_portfolio });
         setDirty(false); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); oneClickRequestId.current = null; await loadLists();
         if (result.status === "uncertain") setError("Gmail did not confirm the result. Do not retry; check Gmail Sent mail manually.");
         else setSuccess("Email generated and sent. Gmail confirmed delivery submission.");
@@ -325,8 +336,9 @@ export function ComposeDashboard() {
               <Field label="Company (optional)" id="company"><input id="company" className="field" value={form.company} onChange={(e) => update("company", e.target.value)} maxLength={160} disabled={draftReadOnly} /></Field>
               <Field label="Job title (optional)" id="role"><input id="role" className="field" value={form.role} onChange={(e) => update("role", e.target.value)} maxLength={160} disabled={draftReadOnly} /></Field>
               <Field label="Email purpose" id="purpose"><select id="purpose" className="field" value={form.purpose_id} onChange={(e) => update("purpose_id", e.target.value)} disabled={draftReadOnly} required>{purposes.map((purpose) => <option key={purpose.id} value={purpose.id}>{purpose.title}{purpose.is_default ? " (default)" : ""}</option>)}</select></Field>
-              <Field label="Resume context" id="resume"><select id="resume" className="field" value={form.resume_id} onChange={(e) => { update("resume_id", e.target.value); if (!e.target.value) update("attach_resume", false); }} disabled={draftReadOnly}><option value="">No resume</option>{resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.display_name}{resume.is_default ? " (default)" : ""}</option>)}</select></Field>
+              <Field label="Optional PDF attachment" id="resume"><select id="resume" className="field" value={form.resume_id} onChange={(e) => { update("resume_id", e.target.value); if (!e.target.value) update("attach_resume", false); }} disabled={draftReadOnly}><option value="">No resume attachment</option>{resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.display_name}{resume.is_default ? " (default)" : ""}</option>)}</select></Field>
               <div className="sm:col-span-2"><label className="flex items-start gap-3 rounded-lg border border-slate-200 p-3 text-sm"><input type="checkbox" className="mt-1 size-4" checked={form.attach_resume} disabled={!form.resume_id || draftReadOnly} onChange={(e) => update("attach_resume", e.target.checked)} /><span><span className="font-semibold text-slate-800">Attach selected resume</span><span className="block text-slate-500">{automaticInitialEnabled ? "The selected private PDF will be attached to the one-click email." : "The private PDF is attached only after final review and explicit approval."}</span></span></label></div>
+              <fieldset className="sm:col-span-2 rounded-lg border border-slate-200 p-3"><legend className="px-1 text-sm font-semibold text-slate-800">Signature links (optional)</legend><p className="mb-3 text-xs text-slate-500">Selected links are appended deterministically; AI cannot choose them.</p><div className="flex flex-wrap gap-4">{([['include_github','GitHub','github_url'],['include_linkedin','LinkedIn','linkedin_url'],['include_portfolio','Portfolio','portfolio_url']] as const).map(([key,label,url])=><label key={key} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={form[key]} disabled={draftReadOnly || !profileLinks[url]} onChange={e=>update(key,e.target.checked)}/>{label}{!profileLinks[url]&&<span className="text-slate-400">(not saved)</span>}</label>)}</div></fieldset>
               <div className="sm:col-span-2"><Field label="Job description (optional)" id="job-description"><textarea id="job-description" className="field min-h-36 resize-y" value={form.job_description} onChange={(e) => update("job_description", e.target.value)} maxLength={12000} disabled={draftReadOnly} /></Field></div>
             </div>
             {!currentConversationId && <>{automaticInitialEnabled && <div role="alert" className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-900"><span className="font-bold">This action sends a real email immediately.</span><span className="mt-1 block">RecruitFlow will generate the subject and body with AI and send them through {gmail.email || "your connected Gmail account"} without showing you the generated text first or requesting another approval.</span></div>}<button className="button-primary mt-5" disabled={busy !== null || draftReadOnly}>{busy === "generate" ? (automaticInitialEnabled ? "Generating and sending…" : "Generating…") : automaticInitialEnabled ? "Generate & Send Email" : currentId ? "Regenerate" : "Generate email"}</button></>}

@@ -1,8 +1,107 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _clean_url(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    value = value.strip()
+    if len(value) > 500 or not value.lower().startswith(("http://", "https://")):
+        raise ValueError("Links must be valid http:// or https:// URLs")
+    return value
+
+
+class ProfileEducationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    degree: str = Field(min_length=1, max_length=160)
+    field: str | None = Field(default=None, max_length=160)
+    institution: str = Field(min_length=1, max_length=200)
+    graduation_status: Literal["completed", "in_progress", "unspecified"] = "unspecified"
+    start_date: date | None = None
+    end_date: date | None = None
+
+    @model_validator(mode="after")
+    def dates_in_order(self):
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValueError("Education end date cannot be before start date")
+        return self
+
+
+class ProfileExperienceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    company: str = Field(min_length=1, max_length=200)
+    role: str = Field(min_length=1, max_length=160)
+    employment_type: Literal["full_time", "internship", "contract", "part_time", "other"] = "other"
+    start_date: date | None = None
+    end_date: date | None = None
+    is_current: bool = False
+    work_summary: str = Field(min_length=1, max_length=5000)
+    technologies: list[str] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def dates_in_order(self):
+        if self.is_current and self.end_date:
+            raise ValueError("Current experience cannot have an end date")
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            raise ValueError("Experience end date cannot be before start date")
+        return self
+
+
+class ProfileSkillGroupInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    category: str = Field(min_length=1, max_length=100)
+    skills: list[str] = Field(min_length=1, max_length=50)
+
+
+class ProfileProjectInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(min_length=1, max_length=200)
+    technologies: list[str] = Field(default_factory=list, max_length=50)
+    description: str = Field(min_length=1, max_length=5000)
+
+
+class ProfileCustomLink(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(min_length=1, max_length=80)
+    url: str
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value): return _clean_url(value)
+
+
+class ProfessionalProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    full_name: str = Field(default="", max_length=120)
+    headline: str | None = Field(default=None, max_length=200)
+    email: str | None = Field(default=None, max_length=320)
+    location: str | None = Field(default=None, max_length=160)
+    summary: str | None = Field(default=None, max_length=2000)
+    experience_duration: str | None = Field(default=None, max_length=120)
+    github_url: str | None = None
+    linkedin_url: str | None = None
+    portfolio_url: str | None = None
+    custom_links: list[ProfileCustomLink] = Field(default_factory=list, max_length=10)
+    education: list[ProfileEducationInput] = Field(default_factory=list, max_length=20)
+    experiences: list[ProfileExperienceInput] = Field(default_factory=list, max_length=30)
+    skill_groups: list[ProfileSkillGroupInput] = Field(default_factory=list, max_length=20)
+    projects: list[ProfileProjectInput] = Field(default_factory=list, max_length=5)
+
+    @field_validator("github_url", "linkedin_url", "portfolio_url")
+    @classmethod
+    def validate_url(cls, value): return _clean_url(value)
+
+    @field_validator("full_name")
+    @classmethod
+    def clean_name(cls, value): return value.strip()
+
+
+class ProfessionalProfileResponse(ProfessionalProfileUpdate):
+    version: int
+    updated_at: datetime
+    verified_gmail_email: str | None = None
 
 
 class SenderProfileResponse(BaseModel):
@@ -169,6 +268,9 @@ class DraftContext(BaseModel):
     purpose_id: UUID
     resume_id: UUID | None = None
     attach_resume: bool = False
+    include_github: bool = False
+    include_linkedin: bool = False
+    include_portfolio: bool = False
 
     @field_validator("recipient_name", "recipient_email")
     @classmethod

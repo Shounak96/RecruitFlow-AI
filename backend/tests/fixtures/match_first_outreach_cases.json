@@ -1,0 +1,90 @@
+[
+  {
+    "synthetic": true,
+    "purpose": {
+      "title": "Referral request",
+      "description": "Show concise evidence of fit for the supplied role and respectfully ask whether the recipient would be comfortable referring me."
+    },
+    "context": {
+      "sender_name": "Avery Chen",
+      "recipient_name": "Morgan Lee",
+      "company": "Northstar Labs",
+      "role": "Backend Engineer",
+      "job_description": "Build reliable Python APIs and improve service observability.",
+      "resume_text": "Completed a BS in Computer Science at Lakeview University. Three years of professional experience. Currently a Software Engineer 2 at Meridian Tools, building Python APIs for an inventory platform. Previously completed a software engineering internship at Harbor Apps. Reduced incident investigation time by 42%, lowered latency to 180 ms, and supported 50,000 users by adding distributed tracing."
+    },
+    "expected": {
+      "supported_background": ["completed BS at Lakeview University", "explicit three years of professional experience", "current Software Engineer 2 at Meridian Tools", "software engineering internship at Harbor Apps"],
+      "supported_evidence": ["Python API work", "distributed tracing reduced incident investigation time"],
+      "primary_cta": "Ask whether Morgan would be comfortable providing a referral.",
+      "must_omit": ["42% improvement", "180 ms latency", "50,000 users", "presenting the Harbor Apps internship as full-time employment", "a second request for a call"],
+      "forbidden_claims": ["Morgan has agreed to refer Avery", "Northstar uses Avery's exact prior architecture"]
+    }
+  },
+  {
+    "synthetic": true,
+    "purpose": {
+      "title": "Recruiter hiring outreach",
+      "description": "Connect my directly relevant experience to the advertised role and invite a short conversation."
+    },
+    "context": {
+      "sender_name": "Sam Rivera",
+      "recipient_name": "Riley Brooks",
+      "company": "Atlas Systems",
+      "role": "Data Platform Engineer",
+      "job_description": "Develop batch pipelines, improve data quality checks, and operate workloads on AWS.",
+      "resume_text": "Completed an MS in Information Systems at Westbridge University. Five years of data engineering experience. Currently works at Summit Data building Airflow batch pipelines on AWS. Previously worked at Quartz Analytics on reporting systems. Introduced validation checks that caught malformed records before downstream reporting."
+    },
+    "expected": {
+      "supported_background": ["completed MS at Westbridge University", "explicit five years of data engineering experience", "current work at Summit Data", "previous work at Quartz Analytics"],
+      "supported_evidence": ["owned Airflow batch pipelines on AWS", "introduced validation checks"],
+      "primary_cta": "Invite Riley to a brief conversation about the supplied role.",
+      "must_omit": ["a referral request", "unrelated technology lists"],
+      "forbidden_claims": ["a specific percentage improvement", "an interview has already been scheduled"]
+    }
+  },
+  {
+    "synthetic": true,
+    "purpose": {
+      "title": "Reconnect",
+      "description": "Jamie and I discussed interoperability after Jamie's panel at the fictional Harbor Tech Conference. Refer to that prior conversation and ask to reconnect about the current role."
+    },
+    "context": {
+      "sender_name": "Taylor Morgan",
+      "recipient_name": "Jamie Patel",
+      "company": "Cedar Health",
+      "role": "Software Engineer",
+      "job_description": "Maintain TypeScript services and collaborate on healthcare workflow integrations.",
+      "resume_text": "Expected to complete an MS in Software Engineering in 2027. Software Engineering Intern at River Clinic in Summer 2025, developing TypeScript services that integrated scheduling data between clinical systems."
+    },
+    "expected": {
+      "supported_background": ["expected MS completion in 2027", "software engineering internship at River Clinic"],
+      "supported_evidence": ["TypeScript services", "clinical scheduling integrations", "supplied conference interaction"],
+      "primary_cta": "Ask Jamie whether they would be open to reconnecting briefly.",
+      "must_omit": ["claiming the MS is completed", "presenting the internship as full-time employment", "inventing years of experience"],
+      "forbidden_claims": ["an ongoing friendship", "Jamie previously promised Taylor a role"]
+    }
+  },
+  {
+    "synthetic": true,
+    "purpose": {
+      "title": "Cold outreach",
+      "description": "Introduce my relevant work and ask for perspective on the recipient's engineering area without assuming an open position."
+    },
+    "context": {
+      "sender_name": "Jordan Kim",
+      "recipient_name": "Casey Woods",
+      "company": "Pioneer Robotics",
+      "role": "",
+      "job_description": "",
+      "resume_text": "Implemented monitoring for distributed device services and wrote runbooks used during incident response."
+    },
+    "expected": {
+      "supported_background": ["monitoring and incident-response work only; no supplied degree, duration, or employer"],
+      "supported_evidence": ["monitoring for distributed device services", "incident-response runbooks"],
+      "primary_cta": "Ask for Casey's perspective or a brief conversation, without asking about a claimed opening.",
+      "must_omit": ["degree or university", "years of experience", "current or previous employer"],
+      "forbidden_claims": ["Pioneer is hiring", "knowledge of Pioneer's internal technical requirements"]
+    }
+  }
+]

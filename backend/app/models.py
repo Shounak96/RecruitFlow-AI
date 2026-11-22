@@ -15,6 +15,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -27,6 +28,95 @@ class SenderProfile(Base):
     owner_id: Mapped[UUID] = mapped_column(unique=True)
     name: Mapped[str] = mapped_column(String(120), default="")
     gmail_identity_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class ProfessionalProfile(Base):
+    __tablename__ = "professional_profiles"
+    __table_args__ = (
+        UniqueConstraint("owner_id", name="professional_profiles_owner_id_key"),
+        Index("ix_professional_profiles_owner_id", "owner_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column()
+    full_name: Mapped[str] = mapped_column(String(120), default="", server_default="")
+    headline: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    experience_duration: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    github_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    linkedin_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    portfolio_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    custom_links: Mapped[list[dict]] = mapped_column(JSONB, default=list, server_default="[]")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ProfileEducation(Base):
+    __tablename__ = "profile_education"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    profile_id: Mapped[UUID] = mapped_column(ForeignKey("professional_profiles.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(default=0)
+    degree: Mapped[str] = mapped_column(String(160))
+    field: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    institution: Mapped[str] = mapped_column(String(200))
+    graduation_status: Mapped[str] = mapped_column(String(20), default="unspecified")
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+class ProfileExperience(Base):
+    __tablename__ = "profile_experiences"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    profile_id: Mapped[UUID] = mapped_column(ForeignKey("professional_profiles.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(default=0)
+    company: Mapped[str] = mapped_column(String(200))
+    role: Mapped[str] = mapped_column(String(160))
+    employment_type: Mapped[str] = mapped_column(String(20), default="other")
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    work_summary: Mapped[str] = mapped_column(Text)
+    technologies: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+
+
+class ProfileSkillGroup(Base):
+    __tablename__ = "profile_skill_groups"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    profile_id: Mapped[UUID] = mapped_column(ForeignKey("professional_profiles.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(default=0)
+    category: Mapped[str] = mapped_column(String(100))
+    skills: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+
+
+class ProfileProject(Base):
+    __tablename__ = "profile_projects"
+    __table_args__ = (
+        CheckConstraint("position >= 0 AND position < 5", name="ck_profile_projects_max_position"),
+        UniqueConstraint("profile_id", "position", name="uq_profile_projects_position"),
+    )
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_id: Mapped[UUID] = mapped_column(index=True)
+    profile_id: Mapped[UUID] = mapped_column(ForeignKey("professional_profiles.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column()
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text)
+    # Legacy fields are retained for the staged 0016 migration and can be dropped later.
+    duration: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    role: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    technologies: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    what_built: Mapped[str | None] = mapped_column(Text, nullable=True)
+    responsibilities: Mapped[str | None] = mapped_column(Text, nullable=True)
+    outcomes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
 
 class Resume(Base):
@@ -120,6 +210,8 @@ class EmailDraft(Base):
     reply_context_fingerprint: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
+    profile_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    included_profile_links: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     recipient_name: Mapped[str] = mapped_column(String(160))
     recipient_email: Mapped[str] = mapped_column(String(320))
     company: Mapped[str | None] = mapped_column(String(160), nullable=True)
