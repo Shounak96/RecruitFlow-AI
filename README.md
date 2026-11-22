@@ -1,6 +1,6 @@
 # RecruitFlow AI
 
-RecruitFlow AI is a local-first web application for creating personalized recruiter outreach without surrendering control of the final message. It grounds AI-generated drafts in a selected resume, reusable outreach purpose, and job context, then requires the user to review and explicitly approve every email and follow-up before Gmail sends it.
+RecruitFlow AI is a local-first web application for personalized recruiter outreach. It grounds AI-generated drafts in an explicit, persistent professional Profile, reusable outreach purpose, and job context; uploaded PDFs are optional Gmail attachments only and are never extracted for AI. Manual review is the default, while an explicit opt-in mode offers one-click AI generation and immediate Gmail sending for initial outreach with no background or scheduled dispatch.
 
 <!-- Screenshot placeholder: Compose, refinement, and final review workflow -->
 <!-- Screenshot placeholder: Settings, resumes, purposes, and Gmail connection -->
@@ -8,14 +8,19 @@ RecruitFlow AI is a local-first web application for creating personalized recrui
 
 ## Implemented capabilities
 
-- Generate structured recruiter emails from a saved sender profile, selected PDF resume, outreach purpose, recipient details, and optional job description.
+- Generate structured recruiter emails from a saved professional Profile, outreach purpose, recipient details, and optional job description.
+- Maintain explicit education status, experience type/duration, categorized skills, validated professional links, and up to five ordered projects. Each project uses only a title, comma-separated technologies, and one free-text description; career facts are never inferred from dates.
 - Manage multiple private resumes and reusable, editable purposes such as cold outreach, referral requests, already-applied notes, and reconnections.
 - Edit persisted drafts or ask AI to refine the current subject and body with a free-text instruction; revisions are proposed separately and never silently overwrite the draft.
-- Use direct Google Gemini or OpenRouter through a shared provider boundary, with optional one-at-a-time failover for eligible temporary provider failures.
+- Use direct Google Gemini, free-only OpenRouter, or explicitly selected local Claude Haiku through a shared provider boundary, with optional one-at-a-time failover and an explicit paid opt-in for Haiku fallback.
 - Connect a verified Gmail identity with OAuth 2.0 and send plain-text email, optionally with the selected PDF attached.
-- Review an immutable server-side snapshot and explicitly approve every individual send. Draft generation, saving, refinement, and review preparation never send email.
+- Use the default immutable review and per-message approval flow, or explicitly click `Generate & Send Email` to generate and immediately send one initial-outreach email without preview.
 - Browse RecruitFlow send history, distinguish confirmed from uncertain delivery, and create contextual follow-ups in the original Gmail thread.
-- Keep inbox access, automated outreach, scheduling, and background sending out of scope.
+- Manually sync recruiter replies only from Gmail thread IDs already saved by RecruitFlow, then view incoming and outgoing messages chronologically with local new-reply indicators.
+- Generate a grounded AI response to the latest eligible recruiter reply, edit or refine it in Compose, and send it in the same Gmail thread only after the normal final review and explicit approval.
+- Remove drafts or entire conversations from RecruitFlow locally without deleting or changing messages in Gmail.
+- Keep manual approval as the default, with optional one-click initial outreach protected by persisted opt-in, per-request consent, idempotency, daily limits, and the existing Gmail send state machine.
+- Keep global inbox scanning, automated outreach, scheduling, and background sending out of scope.
 
 ## Architecture
 
@@ -29,10 +34,11 @@ flowchart LR
     B --> AI[AI provider boundary]
     AI --> G[Google Gemini API]
     AI --> O[OpenRouter API]
+    AI --> A[Anthropic Messages API\nexplicit local Haiku testing]
 
     B --> GS[Gmail service]
     GS --> GO[Google OAuth and UserInfo]
-    GS --> GM[Gmail users.messages.send]
+    GS --> GM[Gmail send and known-thread read APIs]
 
     DB -->|Profiles, purposes, drafts,<br/>reviews, sends, history| B
     FS -->|Resume text or approved attachment| B
@@ -47,8 +53,8 @@ AI keys, the OAuth client secret, and OAuth tokens remain backend-only. FastAPI 
 | Frontend | Next.js 16, React 19, TypeScript 5.9, Tailwind CSS 4 |
 | Backend | Python 3.12, FastAPI, Pydantic Settings, Uvicorn, HTTPX |
 | Data | PostgreSQL 16, SQLAlchemy 2, Psycopg 3, Alembic |
-| AI | Google Gemini `generateContent`, OpenRouter chat completions, PyPDF text extraction |
-| Email | Google OAuth 2.0, OpenID Connect user info, Gmail `users.messages.send`, Python MIME tooling |
+| AI | Google Gemini `generateContent`, OpenRouter chat completions, Anthropic Messages structured output for explicit local Haiku testing, PyPDF text extraction |
+| Email | Google OAuth 2.0, OpenID Connect user info, Gmail send and known-thread read APIs, Python MIME tooling |
 | Security | Fernet token encryption, hashed OAuth state, private generated resume storage keys |
 | Testing | pytest with PostgreSQL integration tests; TypeScript type checking and Next.js production builds |
 
@@ -56,13 +62,16 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 
 ## Engineering details
 
-- **Grounded, structured AI output:** the shared prompt treats resume text, job descriptions, purposes, and refinement guidance as untrusted source data. Both providers must return a bounded object containing exactly `subject` and `body`, which is validated before persistence.
-- **Controlled provider failover:** failover is disabled by default. When enabled with a distinct provider, the backend tries it exactly once after a primary-provider rate limit, transport timeout, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free.
-- **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, and `gmail.send`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend.
+- **Grounded, structured AI output:** the backend prepares one compact, labeled candidate background exclusively from explicit Profile fields and treats Profile, job, purpose, conversation, and refinement content as untrusted data. Every provider receives the same context and must return a bounded object containing exactly `subject` and `body`, which is validated before persistence. Initial outreach prioritizes supported professional history, then candidate-led role evidence, then one purpose-specific request. A conservative deterministic check rejects clear quantitative achievement metrics before manual persistence, refinement, or automatic dispatch while preserving legitimate degree labels, explicit experience duration, position numbers, and numeric job titles.
+- **Controlled provider failover:** failover is disabled by default. An explicitly configured distinct fallback is tried exactly once after a primary-provider rate limit, timeout/connectivity failure, or confirmed upstream 5xx response. Authentication, configuration, input, and malformed-output failures do not trigger failover. OpenRouter rejects models that are not explicitly free; paid Haiku fallback is restricted to local development and guarded by an explicit cost ceiling.
+- **Protected Gmail credentials:** OAuth requests only `openid`, `userinfo.email`, `gmail.send`, and `gmail.readonly`. One-time, expiring OAuth state is stored as a hash; access and refresh tokens are Fernet-encrypted in PostgreSQL and never returned to the frontend. Existing send-only connections are never treated as read-authorized.
 - **Server-enforced approval:** preparing a review snapshots the authenticated sender, recipient, subject, body, draft fingerprint, and attachment metadata. The attachment size and SHA-256 digest are checked again at dispatch. Any intervening draft or conversation change makes the review stale.
 - **Duplicate-send prevention:** PostgreSQL uniqueness constraints, row locks, and durable `pending -> sending -> sent|failed|uncertain` transitions prevent the same approval from being dispatched twice by concurrent requests.
 - **Conservative delivery state:** Gmail confirmation is required before a send becomes `sent`. An ambiguous timeout or transport failure after dispatch becomes non-retryable `uncertain`; the UI instructs the user to check Gmail Sent mail instead of blindly retrying.
-- **Threaded follow-ups without inbox access:** follow-ups use only RecruitFlow's stored outbound messages. The backend retains Gmail thread IDs and RFC `Message-ID` values, supplies `In-Reply-To` and `References`, and rejects follow-ups when same-thread delivery cannot be safely established.
+- **Threaded follow-ups and bounded reply sync:** follow-ups retain Gmail thread IDs and RFC `Message-ID` values, supply `In-Reply-To` and `References`, and are rejected when same-thread delivery cannot be safely established. Reply sync is manual, reads at most 25 known non-deleted RecruitFlow threads per request, stores bounded plain text, and never searches the inbox, downloads attachments, changes labels, or marks Gmail messages read.
+- **Inbound-context-bound AI replies:** the latest eligible received-message ID and a content fingerprint are bound to the immutable send review. Newer, changed, removed, cross-thread, self-authored, alias, or unsupported group context is rejected. The recipient comes from validated Gmail state, never AI output, and every response still requires manual approval.
+- **Durable local deletion:** draft and conversation tombstones hide deleted records from normal APIs while preserving send snapshots, Gmail thread identifiers, and duplicate-send safeguards. Pending reviews become stale, active dispatches cannot be deleted, and no delete operation calls Gmail. Future synchronization must honor the root conversation tombstone.
+- **Controlled one-click dispatch:** persisted preferences default every owner to manual mode. In automatic initial-outreach mode, one explicit `Generate & Send Email` click reserves a durable idempotency key, generates validated grounded content, binds the exact recipient/Gmail identity/attachment checksum, and uses the shared Gmail snapshot, MIME, locking, duplicate-prevention, and uncertain-delivery state machine. AI/pre-dispatch failures consume no claim; uncertain delivery consumes the claim and cannot be retried automatically. Follow-ups and received-message replies remain manual in the main UI. There is no scheduler, background worker, bulk campaign, or automatic reply dispatch.
 
 ## Local setup on Windows
 
@@ -72,7 +81,7 @@ Pinned dependency versions are available in [`backend/requirements.txt`](backend
 - Node.js 20.9 or newer
 - Docker Desktop with Docker Compose
 - Windows PowerShell
-- A Google AI Studio API key or an OpenRouter key configured for an explicitly free model
+- A Google AI Studio API key or an OpenRouter key configured for an explicitly free model; an Anthropic key is optional for explicit local Haiku quality testing
 - A Google Cloud OAuth Web application if Gmail sending will be tested
 
 Run these commands from the repository root unless the command changes directory.
@@ -104,12 +113,28 @@ AI_PROVIDER=gemini
 GEMINI_API_KEY=replace-with-your-key
 GEMINI_MODEL=gemini-3.5-flash-lite
 AI_FALLBACK_ENABLED=false
-AI_FALLBACK_PROVIDER=openrouter
+AI_FALLBACK_PROVIDER=anthropic
 ```
 
 To use OpenRouter as the primary provider, set `AI_PROVIDER=openrouter`, provide `OPENROUTER_API_KEY`, and use `openrouter/free` or a model ID ending in `:free` for `OPENROUTER_MODEL`.
 
-To enable optional failover, set `AI_FALLBACK_ENABLED=true`, choose the distinct fallback in `AI_FALLBACK_PROVIDER`, and configure that provider's key and model as well. There is no paid fallback or recursive retry. The application cannot verify a Google project's billing tier; confirm Free Tier status in Google AI Studio before use.
+Fallback is disabled by default. For an explicit local paid fallback, set `APP_ENV=development`, `AI_PROVIDER=gemini`, `AI_FALLBACK_ENABLED=true`, and `AI_FALLBACK_PROVIDER=anthropic`, then configure the allowlisted Haiku model, API key, and positive local cost ceiling. Gemini is attempted once; Haiku is attempted once only for a rate limit, timeout/connectivity failure, or upstream 5xx. Validation, grounding, authentication, permission, and configuration failures never fall back, and this route never chains into OpenRouter. The cost guard is an estimate, not an Anthropic billing cap.
+
+For an explicit paid Claude Haiku quality comparison in local Manual Approval mode, use:
+
+```dotenv
+APP_ENV=development
+AI_PROVIDER=anthropic
+AI_FALLBACK_ENABLED=false
+ANTHROPIC_API_KEY=replace-with-your-key
+ANTHROPIC_MODEL=claude-haiku-5-5
+ANTHROPIC_TIMEOUT_SECONDS=45
+ANTHROPIC_MAX_ESTIMATED_COST_USD=0.01
+```
+
+Only `claude-haiku-5-5` is accepted. Anthropic is blocked outside `APP_ENV=development`; selecting it as `AI_FALLBACK_PROVIDER` is an explicit paid opt-in and still requires its key and positive cost guard. The guard uses a deliberately conservative local token estimate and bounded 768-token output; it is not Anthropic tokenization or an account-level billing cap.
+
+Restart the backend after changing `.env`. In Settings, keep **Manual Approval** selected and disable automatic sending. Confirm the saved sender profile, select the intended resume and Referral purpose in Compose, paste the actual job description, and click **Generate Email**. Review the subject, factual claims, purpose-specific request, and paragraph structure. Do not open Gmail review, approve, or send during the quality comparison. Restore `AI_PROVIDER=gemini` and restart the backend when finished.
 
 ### 3. Configure Google OAuth
 
@@ -129,6 +154,9 @@ RecruitFlow requests only:
 - `openid`
 - `https://www.googleapis.com/auth/userinfo.email`
 - `https://www.googleapis.com/auth/gmail.send`
+- `https://www.googleapis.com/auth/gmail.readonly`
+
+An existing Gmail connection created before reply sync was added must be reconnected from History so Google can grant `gmail.readonly`. RecruitFlow continues to distinguish a valid send-only connection from one authorized to read known threads.
 
 Generate a Fernet key once:
 
@@ -196,17 +224,17 @@ npm.cmd run build
 Set-Location ..
 ```
 
-Latest verified backend result: **106 tests passed**, with Alembic reporting no schema drift. No live Gemini, OpenRouter, or Gmail requests are made by the automated tests.
+Latest verified backend result: **249 tests passed**. No live Gemini, OpenRouter, Anthropic, or Gmail requests are made by the automated tests.
 
 ## Security limitations
 
 RecruitFlow currently uses one server-selected `LOCAL_OWNER_ID`. This prevents clients from choosing an owner but is **not authentication or multi-tenant isolation**. The application is intended for local development on `127.0.0.1` and is not suitable for public deployment as implemented.
 
-A public deployment would require real authentication and session authorization, per-request tenant isolation, HTTPS, production secret/key management and rotation, CSRF and cookie review, abuse controls, rate limiting, audit and retention policies, OAuth consent/security review, and end-to-end security testing. The application also does not read Gmail inbox content, detect replies, or determine whether an uncertain send was delivered.
+A public deployment would require real authentication and session authorization, per-request tenant isolation, HTTPS, production secret/key management and rotation, CSRF and cookie review, abuse controls, rate limiting, audit and retention policies, OAuth consent/security review, and end-to-end security testing. Manual sync stores bounded reply text locally for known RecruitFlow threads and AI reply generation sends the selected bounded conversation context to the configured provider. The app does not perform a global inbox scan, download attachments, detect replies in the background, or determine whether an uncertain send was delivered.
 
 ## Roadmap
 
 - Production authentication, authorization, observability, privacy controls, accessibility review, and deployment runbooks.
-- Optional V2 automated sending only as an explicit opt-in feature with additional safeguards. It is not implemented in V1; every current email and follow-up requires manual review and approval.
+- Future work may add optional scheduling only after additional authorization, cancellation, operational monitoring, and abuse-prevention design. It is not implemented. Received-message replies always retain the normal manual review and approval workflow.
 
 Detailed product contracts and non-goals are maintained in [`docs/PROJECT.md`](docs/PROJECT.md).

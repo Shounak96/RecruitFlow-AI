@@ -134,6 +134,8 @@ def test_history_is_owner_scoped_searchable_and_distinguishes_uncertain(
     assert history[0]["delivery_state"] == "sent"
     assert history[0]["can_follow_up"] is True
     assert request("GET", f"/api/history/{other_send.id}").status_code == 404
+    assert request("DELETE", f"/api/history/{other_send.id}").status_code == 404
+    assert request("DELETE", "/api/history/not-a-uuid").status_code == 422
 
 
 def test_followup_generation_uses_only_sent_context_and_creates_separate_draft(
@@ -148,6 +150,7 @@ def test_followup_generation_uses_only_sent_context_and_creates_separate_draft(
     assert data["subject"] == "Re: Platform engineering conversation"
     assert data["id"] != str(original.id)
     context = provider.contexts[0]
+    assert context.profile_context is not None
     assert context.is_followup is True
     assert context.followup_guidance == "Keep it short."
     assert context.conversation_history[0]["body"] == root.body
@@ -266,3 +269,145 @@ def test_followup_subject_and_recipient_cannot_leave_thread(db_session: Session)
     payload["recipient_email"] = root.recipient_email
     payload["subject"] = "Different subject"
     assert request("PUT", f"/api/drafts/{draft['id']}", json=payload).status_code == 409
+
+
+def test_delete_conversation_tombstones_all_local_records_without_gmail_calls(
+    db_session: Session,
+) -> None:
+    root, original = seed_conversation(db_session)
+    sent_draft = EmailDraft(
+        owner_id=root.owner_id,
+        purpose_id=original.purpose_id,
+        conversation_id=root.id,
+        recipient_name=original.recipient_name,
+        recipient_email=root.recipient_email,
+        attach_resume=False,
+        subject="Re: Platform engineering conversation",
+        body="Confirmed follow-up",
+        sent_at=datetime.now(timezone.utc),
+    )
+    pending_draft = EmailDraft(
+        owner_id=root.owner_id,
+        purpose_id=original.purpose_id,
+        conversation_id=root.id,
+        recipient_name=original.recipient_name,
+        recipient_email=root.recipient_email,
+        attach_resume=False,
+        subject="Re: Platform engineering conversation",
+        body="Pending follow-up",
+    )
+    db_session.add_all([sent_draft, pending_draft])
+    db_session.flush()
+    sent_followup = EmailSend(
+        owner_id=root.owner_id,
+        draft_id=sent_draft.id,
+        conversation_id=root.id,
+        parent_send_id=root.id,
+        status="sent",
+        draft_fingerprint="b" * 64,
+        sender_email=root.sender_email,
+        recipient_email=root.recipient_email,
+        subject=sent_draft.subject,
+        body=sent_draft.body,
+        sent_at=sent_draft.sent_at,
+        gmail_message_id="gmail-followup",
+        gmail_thread_id=root.gmail_thread_id,
+        rfc_message_id="<followup@verified.example>",
+    )
+    pending_review = EmailSend(
+        owner_id=root.owner_id,
+        draft_id=pending_draft.id,
+        conversation_id=root.id,
+        parent_send_id=sent_followup.id,
+        status="pending",
+        draft_fingerprint="c" * 64,
+        sender_email=root.sender_email,
+        recipient_email=root.recipient_email,
+        subject=pending_draft.subject,
+        body=pending_draft.body,
+    )
+    db_session.add_all([sent_followup, pending_review])
+    db_session.commit()
+    service = ThreadGmailService()
+    app.dependency_overrides[get_gmail_service] = lambda: service
+
+    assert request("DELETE", f"/api/history/{root.id}").status_code == 204
+    assert request("DELETE", f"/api/history/{root.id}").status_code == 204
+    assert service.calls == []
+    assert request("GET", "/api/history").json() == []
+    assert request("GET", f"/api/history/{root.id}").status_code == 404
+    assert request("GET", "/api/drafts").json() == []
+    assert request("GET", "/api/gmail/history").json() == []
+    provider = FollowupProvider()
+    assert generate_followup(root, provider).status_code == 404
+    assert provider.contexts == []
+
+    db_session.expire_all()
+    persisted_root = db_session.get(EmailSend, root.id)
+    persisted_followup = db_session.get(EmailSend, sent_followup.id)
+    persisted_pending = db_session.get(EmailSend, pending_review.id)
+    assert persisted_root.deleted_at is not None
+    assert persisted_root.gmail_message_id == "gmail-root"
+    assert persisted_root.gmail_thread_id == "thread-root"
+    assert persisted_followup.deleted_at is not None
+    assert persisted_followup.status == "sent"
+    assert persisted_pending.deleted_at is not None
+    assert persisted_pending.status == "stale"
+    assert all(
+        db_session.get(EmailDraft, draft_id).deleted_at is not None
+        for draft_id in (original.id, sent_draft.id, pending_draft.id)
+    )
+
+
+def test_delete_uncertain_conversation_preserves_tombstone_and_identifiers(
+    db_session: Session,
+) -> None:
+    root, _ = seed_conversation(db_session)
+    root.status = "uncertain"
+    root.failure_category = "dispatch_timeout"
+    db_session.commit()
+
+    assert request("DELETE", f"/api/history/{root.id}").status_code == 204
+    db_session.expire_all()
+    persisted = db_session.get(EmailSend, root.id)
+    assert persisted.status == "uncertain"
+    assert persisted.failure_category == "dispatch_timeout"
+    assert persisted.gmail_message_id == "gmail-root"
+    assert persisted.deleted_at is not None
+
+
+def test_delete_conversation_rejects_active_dispatch(db_session: Session) -> None:
+    root, original = seed_conversation(db_session)
+    draft = EmailDraft(
+        owner_id=root.owner_id,
+        purpose_id=original.purpose_id,
+        conversation_id=root.id,
+        recipient_name=original.recipient_name,
+        recipient_email=root.recipient_email,
+        attach_resume=False,
+        subject="Re: Platform engineering conversation",
+        body="Sending follow-up",
+    )
+    db_session.add(draft)
+    db_session.flush()
+    db_session.add(
+        EmailSend(
+            owner_id=root.owner_id,
+            draft_id=draft.id,
+            conversation_id=root.id,
+            parent_send_id=root.id,
+            status="sending",
+            draft_fingerprint="d" * 64,
+            sender_email=root.sender_email,
+            recipient_email=root.recipient_email,
+            subject=draft.subject,
+            body=draft.body,
+        )
+    )
+    db_session.commit()
+
+    response = request("DELETE", f"/api/history/{root.id}")
+    assert response.status_code == 409
+    db_session.expire_all()
+    assert db_session.get(EmailSend, root.id).deleted_at is None
+    assert db_session.get(EmailDraft, original.id).deleted_at is None

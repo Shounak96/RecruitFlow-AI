@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 
 const navigation = [
   { href: "/", label: "Compose", icon: "✦" },
+  { href: "/profile", label: "Profile", icon: "◉" },
   { href: "/history", label: "History", icon: "◷" },
   { href: "/settings", label: "Settings", icon: "⚙" },
 ];

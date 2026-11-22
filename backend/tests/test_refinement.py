@@ -23,15 +23,16 @@ REVISED_BODY = "Hi Taylor,\n\nCould we discuss the role briefly?\n\nBest,\nJorda
 
 
 class RefinementProvider:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, body: str = REVISED_BODY) -> None:
         self.error = error
+        self.body = body
         self.contexts = []
 
     async def generate_email(self, context):
         self.contexts.append(context)
         if self.error:
             raise self.error
-        return GeneratedEmail(subject="A shorter introduction", body=REVISED_BODY)
+        return GeneratedEmail(subject="A shorter introduction", body=self.body)
 
 
 def seed_owned_draft(db: Session) -> tuple[EmailDraft, EmailPurpose]:
@@ -99,7 +100,8 @@ def test_refinement_uses_unsaved_content_grounded_context_without_persisting_or_
     db_session.add(resume)
     db_session.commit()
     monkeypatch.setattr(
-        "app.drafts_api.extract_resume_text", lambda path: "Built supported Java services."
+        "app.resume_text.extract_resume_text",
+        lambda path: (_ for _ in ()).throw(AssertionError("PDF extraction must not run")),
     )
     provider = RefinementProvider()
     app.dependency_overrides[get_ai_provider] = lambda: provider
@@ -123,7 +125,7 @@ def test_refinement_uses_unsaved_content_grounded_context_without_persisting_or_
     assert context.current_subject == "Unsaved manual subject"
     assert context.current_body.startswith("Hi Taylor")
     assert context.refinement_instruction.startswith("Include my relevant Java")
-    assert context.resume_text == "Built supported Java services."
+    assert context.profile_context is not None
     assert context.purpose_description == purpose.description
     assert context.attach_resume is True
     db_session.expire_all()
@@ -226,6 +228,26 @@ def test_refinement_maps_provider_failures_without_changing_draft(
         "POST", f"/api/drafts/{draft.id}/refine", json=refinement_payload(purpose.id)
     )
     assert response.status_code == status_code
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft.id).subject == "Saved subject"
+    assert db_session.scalar(select(func.count()).select_from(EmailSend)) == 0
+
+
+def test_initial_outreach_refinement_rejects_metric_revision(
+    db_session: Session,
+) -> None:
+    draft, purpose = seed_owned_draft(db_session)
+    provider = RefinementProvider(
+        body="Hi Taylor,\n\nI improved throughput by 25%.\n\nBest,\nJordan"
+    )
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+
+    response = request(
+        "POST", f"/api/drafts/{draft.id}/refine", json=refinement_payload(purpose.id)
+    )
+
+    assert response.status_code == 502
+    assert "quantitative achievement metrics" in response.json()["detail"]
     db_session.expire_all()
     assert db_session.get(EmailDraft, draft.id).subject == "Saved subject"
     assert db_session.scalar(select(func.count()).select_from(EmailSend)) == 0

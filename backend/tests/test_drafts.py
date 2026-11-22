@@ -14,8 +14,7 @@ from app.ai_provider import (
 )
 from app.config import get_settings
 from app.main import app
-from app.models import EmailDraft, EmailPurpose, Resume, SenderProfile
-from app.resume_text import ResumeExtractionError
+from app.models import EmailDraft, EmailPurpose, EmailSend, Resume, SenderProfile
 from tests.api_client import request
 
 
@@ -28,15 +27,16 @@ GENERATED_BODY = (
 
 
 class FakeProvider:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, body: str = GENERATED_BODY) -> None:
         self.error = error
+        self.body = body
         self.contexts = []
 
     async def generate_email(self, context):
         self.contexts.append(context)
         if self.error:
             raise self.error
-        return GeneratedEmail(subject="A brief introduction", body=GENERATED_BODY)
+        return GeneratedEmail(subject="A brief introduction", body=self.body)
 
 
 def seed_context(db: Session):
@@ -68,6 +68,41 @@ def generation_payload(purpose_id, **overrides):
     return payload
 
 
+def test_selected_profile_links_are_snapshotted_and_appended_only_when_selected(
+    db_session: Session,
+) -> None:
+    purpose = seed_context(db_session)
+    profile_payload = {
+        "full_name": "Jordan", "headline": None, "email": None, "location": None,
+        "summary": None, "experience_duration": None,
+        "github_url": "https://github.com/jordan-example",
+        "linkedin_url": "https://linkedin.com/in/jordan-example",
+        "portfolio_url": None, "custom_links": [], "education": [],
+        "experiences": [], "skill_groups": [], "projects": [],
+    }
+    assert request("PUT", "/api/profile", json=profile_payload).status_code == 200
+    app.dependency_overrides[get_ai_provider] = lambda: FakeProvider()
+
+    generated = request(
+        "POST", "/api/drafts/generate",
+        json=generation_payload(purpose.id, include_github=True, include_linkedin=False),
+    )
+    assert generated.status_code == 200
+    assert generated.json()["body"].endswith("GitHub: https://github.com/jordan-example")
+    assert "linkedin.com" not in generated.json()["body"]
+    assert generated.json()["include_github"] is True
+    draft = db_session.get(EmailDraft, generated.json()["id"])
+    assert draft.profile_fingerprint
+    assert draft.included_profile_links == {"GitHub": "https://github.com/jordan-example"}
+    original_fingerprint = draft.profile_fingerprint
+    profile_payload["github_url"] = "https://github.com/changed-later"
+    assert request("PUT", "/api/profile", json=profile_payload).status_code == 200
+    reloaded = request("GET", f"/api/drafts/{draft.id}").json()
+    assert reloaded["body"] == generated.json()["body"]
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft.id).profile_fingerprint == original_fingerprint
+
+
 def test_generate_persists_grounded_context_and_draft_crud(db_session: Session) -> None:
     purpose = seed_context(db_session)
     provider = FakeProvider()
@@ -81,7 +116,6 @@ def test_generate_persists_grounded_context_and_draft_crud(db_session: Session) 
     assert data["body"] == GENERATED_BODY
     assert provider.contexts[0].purpose_description == purpose.description
     assert provider.contexts[0].job_description == "Build reliable APIs."
-    assert provider.contexts[0].resume_text is None
     assert provider.contexts[0].resume_selected is False
     assert provider.contexts[0].attach_resume is False
 
@@ -114,7 +148,91 @@ def test_generate_persists_grounded_context_and_draft_crud(db_session: Session) 
     assert len(request("GET", "/api/drafts").json()) == 1
 
     assert request("DELETE", f"/api/drafts/{draft_id}").status_code == 204
+    assert request("DELETE", f"/api/drafts/{draft_id}").status_code == 204
     assert request("GET", f"/api/drafts/{draft_id}").status_code == 404
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft_id).deleted_at is not None
+
+
+def test_delete_draft_stales_review_and_blocks_all_draft_actions(
+    db_session: Session,
+) -> None:
+    purpose = seed_context(db_session)
+    draft = EmailDraft(
+        owner_id=get_settings().local_owner_id,
+        purpose_id=purpose.id,
+        recipient_name="Taylor",
+        recipient_email="taylor@example.com",
+        attach_resume=False,
+        subject="Draft to remove",
+        body=GENERATED_BODY,
+    )
+    db_session.add(draft)
+    db_session.flush()
+    review = EmailSend(
+        owner_id=draft.owner_id,
+        draft_id=draft.id,
+        status="pending",
+        draft_fingerprint="f" * 64,
+        sender_email="verified@example.com",
+        recipient_email=draft.recipient_email,
+        subject=draft.subject,
+        body=draft.body,
+    )
+    db_session.add(review)
+    db_session.commit()
+
+    assert request("DELETE", f"/api/drafts/{draft.id}").status_code == 204
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft.id).deleted_at is not None
+    assert db_session.get(EmailSend, review.id).status == "stale"
+    assert request("GET", "/api/drafts").json() == []
+    assert request("GET", f"/api/drafts/{draft.id}").status_code == 404
+
+    update_payload = generation_payload(purpose.id)
+    update_payload.update({"subject": "Changed", "body": GENERATED_BODY})
+    assert request("PUT", f"/api/drafts/{draft.id}", json=update_payload).status_code == 404
+    provider = FakeProvider()
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    assert request(
+        "POST",
+        "/api/drafts/generate",
+        json=generation_payload(purpose.id, draft_id=str(draft.id)),
+    ).status_code == 404
+    assert provider.contexts == []
+
+
+def test_delete_draft_rejects_active_dispatch(db_session: Session) -> None:
+    purpose = seed_context(db_session)
+    draft = EmailDraft(
+        owner_id=get_settings().local_owner_id,
+        purpose_id=purpose.id,
+        recipient_name="Taylor",
+        recipient_email="taylor@example.com",
+        attach_resume=False,
+        subject="Sending draft",
+        body=GENERATED_BODY,
+    )
+    db_session.add(draft)
+    db_session.flush()
+    db_session.add(
+        EmailSend(
+            owner_id=draft.owner_id,
+            draft_id=draft.id,
+            status="sending",
+            draft_fingerprint="f" * 64,
+            sender_email="verified@example.com",
+            recipient_email=draft.recipient_email,
+            subject=draft.subject,
+            body=draft.body,
+        )
+    )
+    db_session.commit()
+
+    response = request("DELETE", f"/api/drafts/{draft.id}")
+    assert response.status_code == 409
+    db_session.expire_all()
+    assert db_session.get(EmailDraft, draft.id).deleted_at is None
 
 
 def test_draft_owner_isolation(db_session: Session) -> None:
@@ -133,6 +251,7 @@ def test_draft_owner_isolation(db_session: Session) -> None:
     assert request("GET", "/api/drafts").json() == []
     assert request("GET", f"/api/drafts/{other.id}").status_code == 404
     assert request("DELETE", f"/api/drafts/{other.id}").status_code == 404
+    assert request("DELETE", "/api/drafts/not-a-uuid").status_code == 422
 
 
 @pytest.mark.parametrize(
@@ -152,7 +271,27 @@ def test_generation_maps_provider_failures(db_session: Session, error, status_co
     assert db_session.scalar(select(EmailDraft)) is None
 
 
-def test_resume_grounding_and_extraction_failure(db_session: Session, monkeypatch) -> None:
+def test_manual_generation_rejects_metric_output_without_persisting_draft(
+    db_session: Session,
+) -> None:
+    purpose = seed_context(db_session)
+    provider = FakeProvider(
+        body=(
+            "Hi Taylor,\n\nI hold an M.S. in Computer Science from Example University "
+            "and have roughly 2 years of professional software experience. I supported 250K+ "
+            "monthly requests.\n\nWould you be open to referring me?\n\nBest,\nJordan"
+        )
+    )
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+
+    response = request("POST", "/api/drafts/generate", json=generation_payload(purpose.id))
+
+    assert response.status_code == 502
+    assert "quantitative achievement metrics" in response.json()["detail"]
+    assert db_session.scalar(select(EmailDraft)) is None
+
+
+def test_resume_is_attachment_only_and_never_extracted(db_session: Session, monkeypatch) -> None:
     purpose = seed_context(db_session)
     storage_key = f"{uuid4().hex}.pdf"
     path = get_settings().resume_storage_path.resolve() / storage_key
@@ -171,29 +310,26 @@ def test_resume_grounding_and_extraction_failure(db_session: Session, monkeypatc
 
     provider = FakeProvider()
     app.dependency_overrides[get_ai_provider] = lambda: provider
-    monkeypatch.setattr("app.drafts_api.extract_resume_text", lambda path: "Verified resume facts")
+    monkeypatch.setattr(
+        "app.resume_text.extract_resume_text",
+        lambda path: (_ for _ in ()).throw(AssertionError("PDF extraction must not run")),
+    )
     response = request(
         "POST",
         "/api/drafts/generate",
         json=generation_payload(purpose.id, resume_id=str(resume.id), attach_resume=True),
     )
     assert response.status_code == 200
-    assert provider.contexts[0].resume_text == "Verified resume facts"
     assert provider.contexts[0].resume_selected is True
     assert provider.contexts[0].attach_resume is True
     assert response.json()["attach_resume"] is True
 
-    monkeypatch.setattr(
-        "app.drafts_api.extract_resume_text",
-        lambda path: (_ for _ in ()).throw(ResumeExtractionError("image-only PDF")),
-    )
-    failed = request(
+    second = request(
         "POST",
         "/api/drafts/generate",
         json=generation_payload(purpose.id, resume_id=str(resume.id)),
     )
-    assert failed.status_code == 422
-    assert failed.json()["detail"] == "image-only PDF"
+    assert second.status_code == 200
 
 
 def test_generation_validation_and_owned_relations(db_session: Session) -> None:

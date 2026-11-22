@@ -1,37 +1,43 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { ApiError, apiRequest } from "@/lib/api";
 
 type Purpose = { id: string; title: string; description: string; is_default: boolean };
 type Resume = { id: string; display_name: string; is_default: boolean };
+type ProfileLinks = { github_url: string | null; linkedin_url: string | null; portfolio_url: string | null };
 type Draft = {
   id: string; recipient_name: string; recipient_email: string; company: string | null;
   role: string | null; job_description: string | null; purpose_id: string;
   resume_id: string | null; attach_resume: boolean; subject: string; body: string;
+  include_github: boolean; include_linkedin: boolean; include_portfolio: boolean;
   created_at: string; updated_at: string; status: "not_sent" | "sent";
   refinement_allowed: boolean;
   conversation_id: string | null;
+  reply_to_received_message_id: string | null;
+  draft_kind: "initial" | "follow_up" | "reply";
 };
 type GmailStatus = { connected: boolean; email: string | null };
+type SendingPreferences = { sending_mode: "manual" | "automatic"; automatic_initial_outreach: boolean; automatic_followups: boolean; daily_send_limit: number };
 type SendReview = {
   id: string; draft_id: string; status: "pending" | "sending" | "sent" | "uncertain" | "failed" | "stale";
   sender_email: string; recipient_email: string; subject: string; body: string;
   attachment: { filename: string; size_bytes: number } | null; created_at: string;
 };
 type SendResult = { status: "sent" | "uncertain" | "failed" };
+type AutomaticSendResult = SendResult & { id: string; draft_id: string; idempotency_key: string };
 type EmailRevision = { subject: string; body: string };
 
 const emptyForm = {
   recipient_name: "", recipient_email: "", company: "", role: "", job_description: "",
   purpose_id: "", resume_id: "", attach_resume: false, subject: "", body: "",
+  include_github: false, include_linkedin: false, include_portfolio: false,
 };
 
 function errorMessage(error: unknown): string {
-  if (error instanceof ApiError && error.status === 429) return "The free AI model is busy. Wait a moment, then try again.";
   return error instanceof Error ? error.message : "Something went wrong. Please try again.";
 }
 
@@ -43,12 +49,15 @@ function formatBytes(bytes: number): string {
 export function ComposeDashboard() {
   const [purposes, setPurposes] = useState<Purpose[]>([]);
   const [resumes, setResumes] = useState<Resume[]>([]);
+  const [profileLinks, setProfileLinks] = useState<ProfileLinks>({github_url:null,linkedin_url:null,portfolio_url:null});
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [currentStatus, setCurrentStatus] = useState<"not_sent" | "sent">("not_sent");
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
+  const [currentDraftKind, setCurrentDraftKind] = useState<Draft["draft_kind"]>("initial");
   const [refinementAllowed, setRefinementAllowed] = useState(true);
   const [gmail, setGmail] = useState<GmailStatus>({ connected: false, email: null });
+  const [sendingPreferences, setSendingPreferences] = useState<SendingPreferences | null>(null);
   const [review, setReview] = useState<SendReview | null>(null);
   const [approved, setApproved] = useState(false);
   const [refinementInstruction, setRefinementInstruction] = useState("");
@@ -56,9 +65,15 @@ export function ComposeDashboard() {
   const [form, setForm] = useState(emptyForm);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"generate" | "refine" | "save" | "delete" | "review" | "send" | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const oneClickRequestId = useRef<string | null>(null);
+  const automaticInitialEnabled = sendingPreferences?.sending_mode === "automatic"
+    && sendingPreferences.automatic_initial_outreach
+    && !currentConversationId
+    && currentDraftKind === "initial";
 
   const saveIsValid = Boolean(
     currentId
@@ -79,14 +94,18 @@ export function ComposeDashboard() {
   const loadLists = useCallback(async () => {
     setError(null);
     try {
-      const [purposeData, resumeData, draftData, gmailData] = await Promise.all([
+      const [purposeData, resumeData, draftData, gmailData, preferenceData, profileData] = await Promise.all([
         apiRequest<Purpose[]>("/api/settings/purposes"),
         apiRequest<Resume[]>("/api/settings/resumes"),
         apiRequest<Draft[]>("/api/drafts"),
         apiRequest<GmailStatus>("/api/gmail/status"),
+        apiRequest<SendingPreferences>("/api/settings/sending-preferences"),
+        apiRequest<ProfileLinks>("/api/profile"),
       ]);
       setPurposes(purposeData); setResumes(resumeData); setDrafts(draftData);
       setGmail(gmailData);
+      setSendingPreferences(preferenceData);
+      setProfileLinks(profileData);
       setForm((previous) => ({
         ...previous,
         purpose_id: previous.purpose_id || purposeData.find((item) => item.is_default)?.id || purposeData[0]?.id || "",
@@ -120,6 +139,9 @@ export function ComposeDashboard() {
       job_description: form.job_description || null, purpose_id: form.purpose_id,
       resume_id: form.resume_id || null,
       attach_resume: Boolean(form.resume_id && form.attach_resume),
+      include_github: form.include_github,
+      include_linkedin: form.include_linkedin,
+      include_portfolio: form.include_portfolio,
     };
   }
 
@@ -128,15 +150,18 @@ export function ComposeDashboard() {
     setCurrentId(draft.id);
     setCurrentStatus(draft.status);
     setCurrentConversationId(draft.conversation_id);
+    setCurrentDraftKind(draft.draft_kind);
     setRefinementAllowed(draft.refinement_allowed);
     setForm({
       recipient_name: draft.recipient_name, recipient_email: draft.recipient_email,
       company: draft.company ?? "", role: draft.role ?? "",
       job_description: draft.job_description ?? "", purpose_id: draft.purpose_id,
       resume_id: draft.resume_id ?? "", attach_resume: draft.attach_resume && Boolean(draft.resume_id),
+      include_github: draft.include_github, include_linkedin: draft.include_linkedin,
+      include_portfolio: draft.include_portfolio,
       subject: draft.subject, body: draft.body,
     });
-    setDirty(false); setError(null); setSuccess(null); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction("");
+    setDirty(false); setError(null); setSuccess(null); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); oneClickRequestId.current = null;
   }
 
   function newDraft() {
@@ -144,28 +169,48 @@ export function ComposeDashboard() {
     setCurrentId(null);
     setCurrentStatus("not_sent");
     setCurrentConversationId(null);
+    setCurrentDraftKind("initial");
     setRefinementAllowed(true);
     setForm({ ...emptyForm, purpose_id: purposes.find((item) => item.is_default)?.id || purposes[0]?.id || "", resume_id: resumes.find((item) => item.is_default)?.id || "" });
-    setDirty(false); setError(null); setSuccess(null); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction("");
+    setDirty(false); setError(null); setSuccess(null); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); oneClickRequestId.current = null;
   }
 
   async function generate(event: FormEvent) {
     event.preventDefault();
     if (busy || currentConversationId) return;
-    if (currentId && dirty && form.subject && !window.confirm("Regenerate and replace your unsaved subject and body edits?")) return;
+    if (!automaticInitialEnabled && currentId && dirty && form.subject && !window.confirm("Regenerate and replace your unsaved subject and body edits?")) return;
     setBusy("generate"); setError(null); setSuccess(null);
     try {
+      if (automaticInitialEnabled) {
+        const requestId = oneClickRequestId.current ?? crypto.randomUUID();
+        oneClickRequestId.current = requestId;
+        const result = await apiRequest<AutomaticSendResult>("/api/drafts/generate-and-send", {
+          method: "POST", body: JSON.stringify({ ...contextPayload(), idempotency_key: requestId }),
+        });
+        const completed = await apiRequest<Draft>(`/api/drafts/${result.draft_id}`);
+        setCurrentId(completed.id); setCurrentStatus(completed.status); setCurrentConversationId(null); setCurrentDraftKind("initial"); setRefinementAllowed(completed.refinement_allowed);
+        setForm({ recipient_name: completed.recipient_name, recipient_email: completed.recipient_email, company: completed.company ?? "", role: completed.role ?? "", job_description: completed.job_description ?? "", purpose_id: completed.purpose_id, resume_id: completed.resume_id ?? "", attach_resume: completed.attach_resume, subject: completed.subject, body: completed.body, include_github: completed.include_github, include_linkedin: completed.include_linkedin, include_portfolio: completed.include_portfolio });
+        setDirty(false); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); oneClickRequestId.current = null; await loadLists();
+        if (result.status === "uncertain") setError("Gmail did not confirm the result. Do not retry; check Gmail Sent mail manually.");
+        else setSuccess("Email generated and sent. Gmail confirmed delivery submission.");
+        return;
+      }
       const generated = await apiRequest<Draft>("/api/drafts/generate", {
         method: "POST", body: JSON.stringify({ ...contextPayload(), draft_id: currentId }),
       });
       setCurrentId(generated.id);
       setCurrentStatus("not_sent");
       setCurrentConversationId(generated.conversation_id);
+      setCurrentDraftKind(generated.draft_kind);
       setRefinementAllowed(generated.refinement_allowed);
       setForm((previous) => ({ ...previous, subject: generated.subject, body: generated.body }));
       setDirty(false); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); await loadLists();
       setSuccess(currentId ? "Draft regenerated and saved." : "Draft generated and saved.");
-    } catch (generationError) { setError(errorMessage(generationError)); }
+    } catch (generationError) {
+      const message = errorMessage(generationError);
+      setError(message);
+      if (generationError instanceof ApiError && !message.includes("already in progress")) oneClickRequestId.current = null;
+    }
     finally { setBusy(null); }
   }
 
@@ -211,15 +256,19 @@ export function ComposeDashboard() {
     setRevision(null); setSuccess("AI revision discarded. Your current draft was not changed.");
   }
 
-  async function remove() {
-    if (!currentId || busy || !window.confirm("Delete this draft? This cannot be undone.")) return;
-    setBusy("delete");
+  async function removeDraft(draftId: string) {
+    if (busy || !window.confirm("Remove this draft from RecruitFlow? It will be permanently hidden in RecruitFlow, but no email will be deleted or changed in Gmail.")) return;
+    setBusy("delete"); setDeletingId(draftId); setError(null); setSuccess(null);
     try {
-      await apiRequest(`/api/drafts/${currentId}`, { method: "DELETE" });
-      setCurrentId(null); setCurrentStatus("not_sent"); setCurrentConversationId(null); setRefinementAllowed(true); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction(""); setForm({ ...emptyForm, purpose_id: purposes[0]?.id || "" }); setDirty(false);
-      await loadLists(); setSuccess("Draft deleted.");
+      await apiRequest(`/api/drafts/${draftId}`, { method: "DELETE" });
+      setDrafts((previous) => previous.filter((draft) => draft.id !== draftId));
+      if (currentId === draftId) {
+        setCurrentId(null); setCurrentStatus("not_sent"); setCurrentConversationId(null); setCurrentDraftKind("initial"); setRefinementAllowed(true); setReview(null); setApproved(false); setRevision(null); setRefinementInstruction("");
+        setForm({ ...emptyForm, purpose_id: purposes.find((item) => item.is_default)?.id || purposes[0]?.id || "", resume_id: resumes.find((item) => item.is_default)?.id || "" }); setDirty(false);
+      }
+      setSuccess("Draft removed from RecruitFlow. Gmail was not changed.");
     } catch (deleteError) { setError(errorMessage(deleteError)); }
-    finally { setBusy(null); }
+    finally { setBusy(null); setDeletingId(null); }
   }
 
   async function prepareReview() {
@@ -259,13 +308,16 @@ export function ComposeDashboard() {
     <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
       <aside className="card h-fit p-4" aria-label="Saved drafts">
         <div className="flex items-center justify-between gap-3"><h2 className="font-bold text-slate-950">Drafts</h2><button type="button" className="button-secondary min-h-9 px-3 py-1" onClick={newDraft}>New</button></div>
-        <p className="mt-1 text-sm text-slate-500">Saved locally · Not sent</p>
+        <p className="mt-1 text-sm text-slate-500">Saved RecruitFlow drafts</p>
         <div className="mt-4 space-y-2">
           {drafts.length === 0 ? <p className="rounded-lg border border-dashed border-slate-300 p-4 text-sm text-slate-500">No saved drafts yet.</p> : drafts.map((draft) => (
-            <button type="button" key={draft.id} onClick={() => openDraft(draft)} className={`w-full rounded-lg border p-3 text-left ${currentId === draft.id ? "border-blue-300 bg-blue-50" : "border-slate-200 hover:bg-slate-50"}`}>
-              <span className="block truncate text-sm font-semibold text-slate-900">{draft.subject}</span>
-              <span className="mt-1 block truncate text-xs text-slate-500">{draft.recipient_name} · {draft.status === "sent" ? "Sent" : "Not sent"}</span>
-            </button>
+            <div key={draft.id} className={`flex items-stretch rounded-lg border ${currentId === draft.id ? "border-blue-300 bg-blue-50" : "border-slate-200"}`}>
+              <button type="button" onClick={() => openDraft(draft)} disabled={busy !== null} className="min-w-0 flex-1 rounded-l-lg p-3 text-left hover:bg-slate-50 disabled:cursor-not-allowed">
+                <span className="block truncate text-sm font-semibold text-slate-900">{draft.subject}</span>
+                <span className="mt-1 block truncate text-xs text-slate-500">{draft.recipient_name} · {draft.draft_kind === "reply" ? "AI reply" : draft.draft_kind === "follow_up" ? "Follow-up" : "Outreach"} · {draft.status === "sent" ? "Sent" : "Not sent"}</span>
+              </button>
+              <button type="button" onClick={() => void removeDraft(draft.id)} disabled={busy !== null} className="rounded-r-lg border-l border-slate-200 px-3 text-xs font-semibold text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60" aria-label={`Delete draft: ${draft.subject}`}>{deletingId === draft.id ? "Deleting…" : "Delete"}</button>
+            </div>
           ))}
         </div>
       </aside>
@@ -284,19 +336,20 @@ export function ComposeDashboard() {
               <Field label="Company (optional)" id="company"><input id="company" className="field" value={form.company} onChange={(e) => update("company", e.target.value)} maxLength={160} disabled={draftReadOnly} /></Field>
               <Field label="Job title (optional)" id="role"><input id="role" className="field" value={form.role} onChange={(e) => update("role", e.target.value)} maxLength={160} disabled={draftReadOnly} /></Field>
               <Field label="Email purpose" id="purpose"><select id="purpose" className="field" value={form.purpose_id} onChange={(e) => update("purpose_id", e.target.value)} disabled={draftReadOnly} required>{purposes.map((purpose) => <option key={purpose.id} value={purpose.id}>{purpose.title}{purpose.is_default ? " (default)" : ""}</option>)}</select></Field>
-              <Field label="Resume context" id="resume"><select id="resume" className="field" value={form.resume_id} onChange={(e) => { update("resume_id", e.target.value); if (!e.target.value) update("attach_resume", false); }} disabled={draftReadOnly}><option value="">No resume</option>{resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.display_name}{resume.is_default ? " (default)" : ""}</option>)}</select></Field>
-              <div className="sm:col-span-2"><label className="flex items-start gap-3 rounded-lg border border-slate-200 p-3 text-sm"><input type="checkbox" className="mt-1 size-4" checked={form.attach_resume} disabled={!form.resume_id || draftReadOnly} onChange={(e) => update("attach_resume", e.target.checked)} /><span><span className="font-semibold text-slate-800">Attach selected resume</span><span className="block text-slate-500">The private PDF is attached only after final review and explicit approval.</span></span></label></div>
+              <Field label="Optional PDF attachment" id="resume"><select id="resume" className="field" value={form.resume_id} onChange={(e) => { update("resume_id", e.target.value); if (!e.target.value) update("attach_resume", false); }} disabled={draftReadOnly}><option value="">No resume attachment</option>{resumes.map((resume) => <option key={resume.id} value={resume.id}>{resume.display_name}{resume.is_default ? " (default)" : ""}</option>)}</select></Field>
+              <div className="sm:col-span-2"><label className="flex items-start gap-3 rounded-lg border border-slate-200 p-3 text-sm"><input type="checkbox" className="mt-1 size-4" checked={form.attach_resume} disabled={!form.resume_id || draftReadOnly} onChange={(e) => update("attach_resume", e.target.checked)} /><span><span className="font-semibold text-slate-800">Attach selected resume</span><span className="block text-slate-500">{automaticInitialEnabled ? "The selected private PDF will be attached to the one-click email." : "The private PDF is attached only after final review and explicit approval."}</span></span></label></div>
+              <fieldset className="sm:col-span-2 rounded-lg border border-slate-200 p-3"><legend className="px-1 text-sm font-semibold text-slate-800">Signature links (optional)</legend><p className="mb-3 text-xs text-slate-500">Selected links are appended deterministically; AI cannot choose them.</p><div className="flex flex-wrap gap-4">{([['include_github','GitHub','github_url'],['include_linkedin','LinkedIn','linkedin_url'],['include_portfolio','Portfolio','portfolio_url']] as const).map(([key,label,url])=><label key={key} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={form[key]} disabled={draftReadOnly || !profileLinks[url]} onChange={e=>update(key,e.target.checked)}/>{label}{!profileLinks[url]&&<span className="text-slate-400">(not saved)</span>}</label>)}</div></fieldset>
               <div className="sm:col-span-2"><Field label="Job description (optional)" id="job-description"><textarea id="job-description" className="field min-h-36 resize-y" value={form.job_description} onChange={(e) => update("job_description", e.target.value)} maxLength={12000} disabled={draftReadOnly} /></Field></div>
             </div>
-            {!currentConversationId && <button className="button-primary mt-5" disabled={busy !== null || draftReadOnly}>{busy === "generate" ? "Generating…" : currentId ? "Regenerate" : "Generate email"}</button>}
+            {!currentConversationId && <>{automaticInitialEnabled && <div role="alert" className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-900"><span className="font-bold">This action sends a real email immediately.</span><span className="mt-1 block">RecruitFlow will generate the subject and body with AI and send them through {gmail.email || "your connected Gmail account"} without showing you the generated text first or requesting another approval.</span></div>}<button className="button-primary mt-5" disabled={busy !== null || draftReadOnly}>{busy === "generate" ? (automaticInitialEnabled ? "Generating and sending…" : "Generating…") : automaticInitialEnabled ? "Generate & Send Email" : currentId ? "Regenerate" : "Generate email"}</button></>}
           </form>
         )}
 
         {(currentId || form.subject || form.body) && (
           <section className="card p-5 sm:p-7" aria-labelledby="draft-editor-heading">
-            <div className="mb-5"><h2 id="draft-editor-heading" className="text-lg font-bold">Draft editor</h2><p className="mt-1 text-sm text-slate-500">{currentStatus === "sent" ? "This sent draft is read-only." : currentConversationId ? "Follow-up draft · The recipient and thread subject are locked to the original Gmail conversation." : "Review and save every word before preparing the final send review."}</p></div>
+            <div className="mb-5"><h2 id="draft-editor-heading" className="text-lg font-bold">Draft editor</h2><p className="mt-1 text-sm text-slate-500">{currentStatus === "sent" ? "This sent draft is read-only." : currentDraftKind === "reply" ? "AI reply draft · The recipient is the verified sender of the latest synced reply, and the Gmail thread subject is locked." : currentConversationId ? "Follow-up draft · The recipient and thread subject are locked to the original Gmail conversation." : "Review and save every word before preparing the final send review."}</p></div>
             <div className="space-y-4"><Field label="Subject" id="subject"><input id="subject" className="field" value={form.subject} onChange={(e) => update("subject", e.target.value)} maxLength={200} disabled={draftReadOnly || Boolean(currentConversationId)} required /></Field><Field label="Body" id="body"><textarea id="body" className="field min-h-80 resize-y leading-7" value={form.body} onChange={(e) => update("body", e.target.value)} maxLength={10000} disabled={draftReadOnly} required /></Field></div>
-            <div className="mt-5 flex flex-wrap items-center gap-2"><button type="button" className="button-primary" onClick={() => void save()} disabled={!canSave} aria-describedby="save-draft-status">{busy === "save" ? "Saving…" : "Save draft"}</button><button type="button" className="button-danger" onClick={() => void remove()} disabled={!currentId || busy !== null || draftReadOnly}>{busy === "delete" ? "Deleting…" : "Delete draft"}</button><span id="save-draft-status" role="status" className={`text-sm font-medium ${dirty ? "text-amber-700" : "text-emerald-700"}`}>{currentStatus === "sent" ? "Sent · Read-only" : !refinementAllowed ? "Active or uncertain send · Read-only" : !currentId ? "Generate the email to create a saved draft." : dirty ? saveIsValid ? "Unsaved changes · Not sent" : "Complete the required fields to save · Not sent" : "Saved · Not sent — edit any field to enable Save draft."}</span></div>
+            <div className="mt-5 flex flex-wrap items-center gap-2"><button type="button" className="button-primary" onClick={() => void save()} disabled={!canSave} aria-describedby="save-draft-status">{busy === "save" ? "Saving…" : "Save draft"}</button><button type="button" className="button-danger" onClick={() => currentId && void removeDraft(currentId)} disabled={!currentId || busy !== null}>{busy === "delete" && deletingId === currentId ? "Deleting…" : "Delete draft"}</button><span id="save-draft-status" role="status" className={`text-sm font-medium ${dirty ? "text-amber-700" : "text-emerald-700"}`}>{currentStatus === "sent" ? "Sent · Read-only" : !refinementAllowed ? "Active or uncertain send · Read-only" : !currentId ? "Generate the email to create a saved draft." : dirty ? saveIsValid ? "Unsaved changes · Not sent" : "Complete the required fields to save · Not sent" : "Saved · Not sent — edit any field to enable Save draft."}</span></div>
             <div className="mt-6 border-t border-slate-200 pt-6">
               <label htmlFor="refinement-instruction" className="block text-sm font-semibold text-slate-800">Ask AI to refine this email</label>
               <textarea id="refinement-instruction" className="field mt-2 min-h-24 resize-y" value={refinementInstruction} onChange={(event) => setRefinementInstruction(event.target.value)} placeholder="e.g. Make it shorter and rewrite the opening." maxLength={1000} disabled={!currentId || refinementBlocked || busy === "refine"} />
@@ -313,10 +366,10 @@ export function ComposeDashboard() {
           </section>
         )}
 
-        {currentId && currentStatus === "not_sent" && (
+        {currentId && currentStatus === "not_sent" && !automaticInitialEnabled && (
           <section className="card p-5 sm:p-7" aria-labelledby="send-review-heading">
             <h2 id="send-review-heading" className="text-lg font-bold">Final send review</h2>
-            {currentConversationId && <p className="mt-2 rounded-lg bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800">This follow-up will be sent in its original Gmail conversation.</p>}
+            {currentConversationId && <p className="mt-2 rounded-lg bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-800">{currentDraftKind === "reply" ? "This response will go to the sender of the latest synced recruiter reply in the original Gmail thread." : "This follow-up will be sent in its original Gmail conversation."}</p>}
             {!gmail.connected ? <p className="mt-2 text-sm text-slate-600">Connect Gmail in <Link href="/settings" className="font-semibold text-blue-700 underline">Settings</Link> before preparing a send review.</p> : dirty ? <p className="mt-2 text-sm text-amber-700">Save your changes before preparing the final review.</p> : !review ? <><p className="mt-2 text-sm text-slate-600">Preparing a review does not send anything. You must approve the reviewed snapshot separately.</p><button type="button" className="button-primary mt-4" onClick={() => void prepareReview()} disabled={busy !== null}>{busy === "review" ? "Preparing…" : "Prepare final review"}</button></> : (
               <div className="mt-5 space-y-4">
                 <dl className="grid gap-3 rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm sm:grid-cols-[8rem_1fr]"><dt className="font-semibold">From</dt><dd>{review.sender_email}</dd><dt className="font-semibold">To</dt><dd>{review.recipient_email}</dd><dt className="font-semibold">Subject</dt><dd>{review.subject}</dd><dt className="font-semibold">Attachment</dt><dd>{review.attachment ? `${review.attachment.filename} (${formatBytes(review.attachment.size_bytes)})` : "No attachment"}</dd></dl>
